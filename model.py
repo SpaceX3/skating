@@ -49,6 +49,18 @@ class scoring_head(nn.Module):
         self.hidden_linear = nn.Linear(dim, dim)
         self.output = head(dim, num_scores)
 
+        # time-wise scoring head: 2 hidden layers MLP applied on each timestep feature
+        # input: [B, T, dim] -> output: [B, T, num_scores]
+        hidden1 = dim
+        hidden2 = max(dim // 2, 1)
+        self.time_score_mlp = nn.Sequential(
+            nn.Linear(dim, hidden1),
+            nn.GELU(),
+            nn.Linear(hidden1, hidden2),
+            nn.GELU(),
+            nn.Linear(hidden2, num_scores),
+        )
+
         # for c3d & vggish
         # self.video_transform_linear = nn.Linear(input_dim, dim)
         # self.audio_transform_linear = nn.Linear(input_dim, dim)
@@ -90,26 +102,25 @@ class scoring_head(nn.Module):
                 back_hidden_states.insert(0, back_cls)
                 
 
-        final_output = []
+        final_scores = []
         for i in range(batch_size):
             curr_batch_audio_len = audio_len[i]
             curr_batch_video_len = video_len[i]
             curr_batch_len = min(curr_batch_audio_len, curr_batch_video_len)
 
+            # [1, T, dim]
             cl = torch.cat(hidden_states[:curr_batch_len], dim=1)[i:i+1]
             bk_cl = torch.cat(back_hidden_states[:curr_batch_len], dim=1)[i:i+1]
-            
-            cl_out = torch.mean(cl, dim=1)
-            bk_cl_out = torch.mean(bk_cl, dim=1)
 
-            batch_out = (cl_out + bk_cl_out) / 2
-            final_output.append(batch_out)
-        
-        final_output = torch.cat(final_output, dim=0)
-        output = self.output(final_output)
-        output = torch.squeeze(output, dim=1)
+            # do NOT average over time; average cl/bk_cl at each timestep
+            time_feat = (cl + bk_cl) / 2  # [1, T, dim]
 
+            # MLP predicts score per timestep, then aggregate to scalar score
+            time_score = self.time_score_mlp(time_feat).squeeze(-1)  # [1, T]
+            batch_score = torch.mean(time_score, dim=1)  # [1]
+            final_scores.append(batch_score)
 
+        output = torch.cat(final_scores, dim=0)  # [B]
         return output
     
     def model_forward(self, x, hidden_state=None, first_frame=False, back=False):
