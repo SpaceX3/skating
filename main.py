@@ -21,6 +21,9 @@ def validation(dataloader, model, criterion, score_index):
 
 
     for audio_feature, video_feature, inv_audio_feature, inv_video_feature, audio_len, video_len, score, data_index in dataloader:
+        audio_feature = audio_feature.squeeze(dim=2)
+        inv_audio_feature = inv_audio_feature.squeeze(dim=2)
+        
         batch_size, _, _, _ = audio_feature.shape
         audio_feature = audio_feature.cuda(device=dev)
         video_feature = video_feature.cuda(device=dev)
@@ -53,7 +56,7 @@ if __name__ == '__main__':
     val_dataloader = data.DataLoader(dataset=val_dataset, batch_size=16, num_workers=8, collate_fn=av_collate_fn)
 
     # model
-    model = scoring_head(depth=2, input_dim=768, dim=512, input_len=16, num_scores=1).cuda(device=dev)  #, bidirection=True
+    model = scoring_head(depth=2, input_dim=4096, dim=512, input_len=12, num_scores=1).cuda(device=dev)  #, bidirection=True
 
     epochs = 100
     warm_up_epochs = 10
@@ -76,6 +79,12 @@ if __name__ == '__main__':
         print("epoch ", epoch_idx)
         
         for audio_feature, video_feature, inv_audio_feature, inv_video_feature, audio_len, video_len, score, data_index in train_dataloader:
+            # print(f"audio_feature shape: {audio_feature.shape}, video_feature shape: {video_feature.shape}, inv_audio_feature shape: {inv_audio_feature.shape}, inv_video_feature shape: {inv_video_feature.shape}")
+            # audio_feature shape: torch.Size([16, 124, 1, 768]), video_feature shape: torch.Size([16, 123, 15, 768])
+            audio_feature = audio_feature.squeeze(dim=2)
+            inv_audio_feature = inv_audio_feature.squeeze(dim=2)
+
+
             audio_feature = audio_feature.cuda(device=dev)
             video_feature = video_feature.cuda(device=dev)
             inv_audio_feature = inv_audio_feature.cuda(device=dev)

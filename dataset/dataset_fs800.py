@@ -35,8 +35,8 @@ class FeatureDataset(data.Dataset):
         data_info = self.total_data[index]
         data_index = data_info[0]
         
-        audio_path = "../FS1000 Dataset/new feature/ast_feature_fs1000_new/" + data_index + '.npy'
-        video_path = "../FS1000 Dataset/Timesformer_output_feature_fs800/" + data_index + '.npy'
+        audio_path = "../FS1000 Dataset/new feature/vggish_feature_fs1000/" + data_index + '.npy'
+        video_path = "../FS1000 Dataset/new feature/c3d_feat_fs1000_new/" + data_index + '.npy'
 
         audio_feature = torch.from_numpy(np.load(audio_path))
         video_feature = torch.from_numpy(np.load(video_path))
