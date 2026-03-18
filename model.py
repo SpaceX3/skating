@@ -115,7 +115,7 @@ class scoring_head(nn.Module):
     def model_forward(self, x, hidden_state=None, first_frame=False, back=False):
         # x shape: B x 2 (a & v) x D
 
-        x = self.linear1(x)
+        # x = self.linear1(x)
 
         if back:
             batch_size = x.shape[0]
