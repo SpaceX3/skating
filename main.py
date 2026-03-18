@@ -59,6 +59,7 @@ if __name__ == '__main__':
     warm_up_epochs = 10
     # optimizer
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=5e-6)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=15, gamma=0.5)
 
     # criterion
     criterion = torch.nn.MSELoss()
@@ -93,7 +94,7 @@ if __name__ == '__main__':
 
             loss.backward()
             optimizer.step()
-        
+        scheduler.step()
         # validation
         val_loss, spear = validation(val_dataloader, model, criterion, score_index)
         print("val_loss: ", val_loss, " | spear corr: ", spear)
