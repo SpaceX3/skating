@@ -40,8 +40,8 @@ class scoring_head(nn.Module):
         
         self.linear_forward = nn.Sequential(
             *[nn.Sequential(
-                PreNormResidual(dim, FeedForward((input_len + 2), dense = partial(nn.Conv1d, kernel_size=1))),
-                PreNormResidual(dim, FeedForward(dim))) for _ in range(depth)] 
+                PreNormResidual(dim, FeedForward((input_len + 2), dense = partial(nn.Conv1d, kernel_size=1))),  # token mixing
+                PreNormResidual(dim, FeedForward(dim))) for _ in range(depth)]    # channel mixing
         )
 
         self.layer_norm = nn.LayerNorm(dim)
