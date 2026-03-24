@@ -75,8 +75,12 @@ if __name__ == '__main__':
     for epoch_idx in range(epochs):
         print("="*25)
         print("epoch ", epoch_idx)
+        epoch_train_loss = 0.0
+        train_truth = []
+        train_pred = []
         
         for audio_feature, video_feature, inv_audio_feature, inv_video_feature, audio_len, video_len, score, data_index in train_dataloader:
+            batch_size, _, _, _ = audio_feature.shape
             audio_feature = audio_feature.cuda(device=dev)
             video_feature = video_feature.cuda(device=dev)
             inv_audio_feature = inv_audio_feature.cuda(device=dev)
@@ -91,9 +95,17 @@ if __name__ == '__main__':
 
             loss = criterion(output, target)
             train_loss = loss.item()
+            epoch_train_loss += train_loss * batch_size
+            train_pred.append(output.detach().data.cpu().numpy())
+            train_truth.append(target.detach().cpu().numpy())
 
             loss.backward()
             optimizer.step()
+        train_truth = np.concatenate(train_truth)
+        train_pred = np.concatenate(train_pred)
+        train_spear = spearmanr(train_truth, train_pred).correlation
+        epoch_train_loss = epoch_train_loss / len(train_dataloader.dataset)
+        print("train_loss: ", epoch_train_loss, " | train spear corr: ", train_spear)
         scheduler.step()
         # validation
         val_loss, spear = validation(val_dataloader, model, criterion, score_index)

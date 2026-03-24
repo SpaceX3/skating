@@ -29,14 +29,19 @@ class PreNormResidual(nn.Module):
         return self.fn(self.norm(x)) + x
 
 class scoring_head(nn.Module):
-    def __init__(self, depth, input_dim, dim, input_len=2, num_scores=1):
+    def __init__(self, depth, input_dim, dim, input_len=2, num_scores=1, memory_size=64):
         super().__init__()
 
 
-        self.hidden_state = nn.parameter.Parameter(torch.randn(1, dim))
+        self.init_memory_key = nn.parameter.Parameter(torch.randn(1, dim))
+        self.init_memory_value = nn.parameter.Parameter(torch.randn(1, dim))
         self.cls_token = nn.parameter.Parameter(torch.randn(1, dim))
+        self.memory_size = memory_size
 
         self.linear1 = nn.Linear(input_dim, dim)
+        self.mem_query = nn.Linear(dim, dim)
+        self.mem_key = nn.Linear(dim, dim)
+        self.mem_value = nn.Linear(dim, dim)
         
         self.linear_forward = nn.Sequential(
             *[nn.Sequential(
@@ -65,6 +70,26 @@ class scoring_head(nn.Module):
         # self.video_transform_linear = nn.Linear(input_dim, dim)
         # self.audio_transform_linear = nn.Linear(input_dim, dim)
 
+    def _init_memory_bank(self, batch_size, device, dtype):
+        memory_key = self.init_memory_key.unsqueeze(dim=0).expand(batch_size, -1, -1).to(device=device, dtype=dtype)
+        memory_value = self.init_memory_value.unsqueeze(dim=0).expand(batch_size, -1, -1).to(device=device, dtype=dtype)
+        return memory_key, memory_value
+
+    def _read_memory(self, query, memory_key, memory_value):
+        # query: [B, 1, D], memory_key/value: [B, M, D]
+        attn_score = torch.matmul(query, memory_key.transpose(1, 2)) / math.sqrt(query.size(-1))
+        attn_weight = torch.softmax(attn_score, dim=-1)
+        memory_context = torch.matmul(attn_weight, memory_value)
+        return memory_context
+
+    def _update_memory_bank(self, memory_key, memory_value, new_key, new_value):
+        memory_key = torch.cat([memory_key, new_key], dim=1)
+        memory_value = torch.cat([memory_value, new_value], dim=1)
+        if memory_key.size(1) > self.memory_size:
+            memory_key = memory_key[:, -self.memory_size:]
+            memory_value = memory_value[:, -self.memory_size:]
+        return memory_key, memory_value
+
     def forward(self, audio_feature, video_feature, inv_audio_feature, inv_video_feature, audio_len, video_len):
         batch_size, aclip, _, _ = audio_feature.shape
         batch_size, vclip, _, _ = video_feature.shape
@@ -72,6 +97,8 @@ class scoring_head(nn.Module):
 
         hidden_states = []
         back_hidden_states = []
+        fwd_memory_key, fwd_memory_value = self._init_memory_bank(batch_size, audio_feature.device, audio_feature.dtype)
+        bwd_memory_key, bwd_memory_value = self._init_memory_bank(batch_size, audio_feature.device, audio_feature.dtype)
 
         for j in range(clip):
             
@@ -87,19 +114,14 @@ class scoring_head(nn.Module):
             # back_curr_video_feature = self.video_transform_linear(back_curr_video_feature)
             back_input_feature = torch.cat([back_curr_audio_feature, back_curr_video_feature], dim=1)
             
-            if j == 0:
-                hidden_state, cls = self.model_forward(input_feature, first_frame=True)
-                back_hidden_state, back_cls = self.model_forward(back_input_feature, first_frame=True, back=True)
+            cls, new_fwd_key, new_fwd_value = self.model_forward(input_feature, fwd_memory_key, fwd_memory_value)
+            back_cls, new_bwd_key, new_bwd_value = self.model_forward(back_input_feature, bwd_memory_key, bwd_memory_value, back=True)
 
-                hidden_states.append(cls)
-                back_hidden_states.insert(0, back_cls)
+            fwd_memory_key, fwd_memory_value = self._update_memory_bank(fwd_memory_key, fwd_memory_value, new_fwd_key, new_fwd_value)
+            bwd_memory_key, bwd_memory_value = self._update_memory_bank(bwd_memory_key, bwd_memory_value, new_bwd_key, new_bwd_value)
 
-            else:
-                hidden_state, cls = self.model_forward(input_feature, hidden_state)
-                back_hidden_state, back_cls = self.model_forward(back_input_feature, back_hidden_state, back=True)
-
-                hidden_states.append(cls)
-                back_hidden_states.insert(0, back_cls)
+            hidden_states.append(cls)
+            back_hidden_states.insert(0, back_cls)
                 
 
         final_scores = []
@@ -123,47 +145,39 @@ class scoring_head(nn.Module):
         output = torch.cat(final_scores, dim=0)  # [B]
         return output
     
-    def model_forward(self, x, hidden_state=None, first_frame=False, back=False):
+    def model_forward(self, x, memory_key, memory_value, back=False):
         # x shape: B x 2 (a & v) x D
 
         x = self.linear1(x)
+        query = self.mem_query(torch.mean(x, dim=1, keepdim=True))
+        memory_context = self._read_memory(query, memory_key, memory_value)
 
         if back:
             batch_size = x.shape[0]
-            if first_frame:
-                
-                back_hidden_state = self.hidden_state.unsqueeze(dim=0)
-                hidden_state = torch.cat([back_hidden_state for _ in range(batch_size)], dim=0)
-
             back_cls_token = self.cls_token.unsqueeze(dim=0)
             cls_token = torch.cat([back_cls_token for _ in range(batch_size)], dim=0)
 
-            concat_input = torch.cat([cls_token, x, hidden_state], dim=1)
+            concat_input = torch.cat([cls_token, x, memory_context], dim=1)
 
         else:
             batch_size = x.shape[0]
-            if first_frame:
-                
-                hidden_state = self.hidden_state.unsqueeze(dim=0)
-                hidden_state = torch.cat([hidden_state for _ in range(batch_size)], dim=0)
-
             cls_token = self.cls_token.unsqueeze(dim=0)
             cls_token = torch.cat([cls_token for _ in range(batch_size)], dim=0)
 
-            concat_input = torch.cat([hidden_state, x, cls_token], dim=1)
+            concat_input = torch.cat([memory_context, x, cls_token], dim=1)
         
         out = self.linear_forward(concat_input)
 
         if back:
             out_cls = out[:, 0:1]
-            out_hs = out[:, -1:]
         else:
-            out_hs = out[:, 0:1]
             out_cls = out[:, -1:]
 
         out_cls = self.hidden_linear(out_cls)
+        new_memory_key = self.mem_key(query)
+        new_memory_value = self.mem_value(out_cls)
 
-        return out_hs, out_cls
+        return out_cls, new_memory_key, new_memory_value
 
 
 class head(nn.Module):
