@@ -118,8 +118,12 @@ class scoring_head(nn.Module):
         if not self.use_global_memory:
             return torch.zeros_like(query)
 
-        global_key = self.global_mem_key_proj(self.global_memory_key).to(device=query.device, dtype=query.dtype)
-        global_value = self.global_mem_value_proj(self.global_memory_value).to(device=query.device, dtype=query.dtype)
+        # Use cloned snapshots so in-forward EMA updates on global buffers do not
+        # trigger autograd version mismatch for tensors saved for backward.
+        key_snapshot = self.global_memory_key.detach().clone()
+        value_snapshot = self.global_memory_value.detach().clone()
+        global_key = self.global_mem_key_proj(key_snapshot).to(device=query.device, dtype=query.dtype)
+        global_value = self.global_mem_value_proj(value_snapshot).to(device=query.device, dtype=query.dtype)
         global_key = global_key.unsqueeze(0).expand(query.size(0), -1, -1)
         global_value = global_value.unsqueeze(0).expand(query.size(0), -1, -1)
         return self._read_memory(query, global_key, global_value)
