@@ -59,13 +59,13 @@ if __name__ == '__main__':
     warm_up_epochs = 10
     # optimizer
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=5e-6)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=15, gamma=0.7)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.7)
 
     # criterion
     criterion = torch.nn.MSELoss()
 
     # other parameter
-    score_index = 0
+    score_index = 1
 
     min_val_loss = 10000
     max_spear_cor = 0
