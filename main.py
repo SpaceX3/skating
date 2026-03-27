@@ -11,7 +11,7 @@ import math
 # import time
 # import warnings
 
-dev = 0
+dev = 1
 
 def validation(dataloader, model, criterion, score_index):
     model.eval()
@@ -55,11 +55,11 @@ if __name__ == '__main__':
     # model
     model = scoring_head(depth=2, input_dim=768, dim=512, input_len=16, num_scores=1).cuda(device=dev)  #, bidirection=True
 
-    epochs = 100
+    epochs = 200
     warm_up_epochs = 10
     # optimizer
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=5e-6)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=15, gamma=0.5)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=15, gamma=0.7)
 
     # criterion
     criterion = torch.nn.MSELoss()

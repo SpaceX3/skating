@@ -51,8 +51,8 @@ class scoring_head(nn.Module):
 
         # time-wise scoring head: 2 hidden layers MLP applied on each timestep feature
         # input: [B, T, dim] -> output: [B, T, num_scores]
-        hidden1 = dim
-        hidden2 = max(dim // 2, 1)
+        hidden1 = dim // 2
+        hidden2 = max(dim // 4, 1)
         self.time_score_mlp = nn.Sequential(
             nn.Linear(dim, hidden1),
             nn.GELU(),
