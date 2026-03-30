@@ -8,6 +8,28 @@ from scipy.stats import spearmanr
 
 dev = 0
 
+def set_trainable_params_for_stage(model, freeze_dynamic_backbone):
+    """
+    Stage-1: only train static projection and time scoring head.
+    Stage-2: train all params.
+    """
+    if freeze_dynamic_backbone:
+        for name, param in model.named_parameters():
+            if ("static_proj" in name) or ("time_score_mlp" in name):
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
+    else:
+        for _, param in model.named_parameters():
+            param.requires_grad = True
+
+
+def build_optimizer_and_scheduler(model, lr=1e-4, weight_decay=1e-4):
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.Adam(trainable_params, lr=lr, weight_decay=weight_decay)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=15, gamma=0.5)
+    return optimizer, scheduler
+
 def validation(dataloader, model, criterion, score_index):
     model.eval()
     val_loss = 0
@@ -46,6 +68,7 @@ if __name__ == '__main__':
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--strict_static_cache", action="store_true")
     parser.add_argument("--allow_missing_static_cache", action="store_true")
+    parser.add_argument("--freeze_dynamic_epochs", type=int, default=50)
     args = parser.parse_args()
 
     dev = args.gpu
@@ -92,9 +115,13 @@ if __name__ == '__main__':
 
     epochs = 100
     warm_up_epochs = 10
-    # optimizer
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=15, gamma=0.5)
+    # two-stage training:
+    # stage-1 freezes dynamic backbone and only trains static projection + regression head
+    freeze_dynamic_epochs = max(args.freeze_dynamic_epochs, 0)
+    set_trainable_params_for_stage(model, freeze_dynamic_backbone=(freeze_dynamic_epochs > 0))
+    optimizer, scheduler = build_optimizer_and_scheduler(model, lr=1e-4, weight_decay=1e-4)
+    if freeze_dynamic_epochs > 0:
+        print(f"Stage-1 enabled: freeze dynamic backbone for first {freeze_dynamic_epochs} epochs.")
 
     # criterion
     criterion = torch.nn.MSELoss()
@@ -110,6 +137,11 @@ if __name__ == '__main__':
     model.train()
 
     for epoch_idx in range(epochs):
+        if freeze_dynamic_epochs > 0 and epoch_idx == freeze_dynamic_epochs:
+            set_trainable_params_for_stage(model, freeze_dynamic_backbone=False)
+            optimizer, scheduler = build_optimizer_and_scheduler(model, lr=1e-4, weight_decay=1e-4)
+            print("Stage-2 enabled: unfreeze all parameters and continue joint training.")
+
         print("="*25)
         print("epoch ", epoch_idx)
         epoch_train_loss = 0.0
