@@ -11,7 +11,7 @@ import math
 # import time
 # import warnings
 
-dev = 0
+dev = 1
 
 def validation(dataloader, model, criterion, score_index):
     model.eval()
@@ -65,7 +65,7 @@ if __name__ == '__main__':
     criterion = torch.nn.MSELoss()
 
     # other parameter
-    score_index = 0
+    score_index = 1
 
     min_val_loss = 10000
     max_spear_cor = 0
