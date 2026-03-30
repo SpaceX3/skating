@@ -77,12 +77,23 @@ if __name__ == '__main__':
     )
 
     # model
-    model = scoring_head(depth=2, input_dim=768, dim=512, input_len=16, num_scores=1, use_static_branch=True, static_in_dim=2048).cuda(device=dev)  #, bidirection=True
+    model = scoring_head(
+        depth=2,
+        input_dim=768,
+        dim=512,
+        input_len=16,
+        num_scores=1,
+        use_static_branch=True,
+        static_in_dim=2048,
+        static_proj_dim=128,
+        fusion_dropout=0.3,
+        time_mlp_dropout=0.3,
+    ).cuda(device=dev)  #, bidirection=True
 
     epochs = 100
     warm_up_epochs = 10
     # optimizer
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=5e-6)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=15, gamma=0.5)
 
     # criterion
@@ -93,6 +104,8 @@ if __name__ == '__main__':
 
     min_val_loss = 10000
     max_spear_cor = 0
+    patience = 10
+    no_improve_epochs = 0
 
     model.train()
 
@@ -137,8 +150,11 @@ if __name__ == '__main__':
         print("val_loss: ", val_loss, " | spear corr: ", spear)
         if val_loss < min_val_loss:
             min_val_loss = val_loss
+            no_improve_epochs = 0
             
             torch.save(model.state_dict(), "./fs800_result/checkpoint_pe.pth")
+        else:
+            no_improve_epochs += 1
         if spear > max_spear_cor:
             max_spear_cor = spear
         print("min validation loss: ", min_val_loss, " | max spear corr: ", max_spear_cor)
@@ -147,5 +163,8 @@ if __name__ == '__main__':
         
         print(optimizer.param_groups[0]['lr'])
         # scheduler.step()
-        
+        if no_improve_epochs >= patience:
+            print(f"Early stop triggered: val loss does not improve for {patience} epochs.")
+            break
+
         

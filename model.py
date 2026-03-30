@@ -38,6 +38,9 @@ class scoring_head(nn.Module):
         num_scores=1,
         use_static_branch=False,
         static_in_dim=2048,
+        static_proj_dim=128,
+        fusion_dropout=0.3,
+        time_mlp_dropout=0.3,
         memory_size=64,
         write_stride=4,
         use_rag_memory=True,
@@ -49,6 +52,7 @@ class scoring_head(nn.Module):
         super().__init__()
         self.use_static_branch = use_static_branch
         self.static_in_dim = static_in_dim
+        self.static_proj_dim = static_proj_dim
 
 
         self.init_memory_key = nn.parameter.Parameter(torch.randn(1, dim))
@@ -94,16 +98,19 @@ class scoring_head(nn.Module):
         hidden1 = dim
         hidden2 = max(dim // 2, 1)
 
-        fused_dim = dim * 2 if self.use_static_branch else dim
+        fused_dim = dim + static_proj_dim if self.use_static_branch else dim
+        self.fusion_dropout = nn.Dropout(fusion_dropout)
         if self.use_static_branch:
-            # Project static embedding to the same dim as dynamic embedding before concat.
-            self.static_proj = nn.Linear(static_in_dim, dim)
+            # Project static embedding to lower dim to reduce overfitting.
+            self.static_proj = nn.Linear(static_in_dim, static_proj_dim)
 
         self.time_score_mlp = nn.Sequential(
             nn.Linear(fused_dim, hidden1),
             nn.GELU(),
+            nn.Dropout(time_mlp_dropout),
             nn.Linear(hidden1, hidden2),
             nn.GELU(),
+            nn.Dropout(time_mlp_dropout),
             nn.Linear(hidden2, num_scores),
         )
 
@@ -229,8 +236,9 @@ class scoring_head(nn.Module):
                 if static_feature is None:
                     raise ValueError("static_feature must be provided when use_static_branch=True")
                 static_time_feat = static_feature[i:i+1, :curr_batch_len]  # [1, T, static_in_dim]
-                static_time_feat = self.static_proj(static_time_feat)  # [1, T, dim]
-                time_feat = torch.cat([time_feat, static_time_feat], dim=-1)  # [1, T, 2*dim]
+                static_time_feat = self.static_proj(static_time_feat)  # [1, T, static_proj_dim]
+                time_feat = torch.cat([time_feat, static_time_feat], dim=-1)  # [1, T, dim + static_proj_dim]
+                time_feat = self.fusion_dropout(time_feat)
 
             # MLP predicts score per timestep, then aggregate to scalar score
             time_score = self.time_score_mlp(time_feat).squeeze(-1)  # [1, T]
