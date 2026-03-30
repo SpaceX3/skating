@@ -36,6 +36,8 @@ class scoring_head(nn.Module):
         dim,
         input_len=2,
         num_scores=1,
+        use_static_branch=False,
+        static_in_dim=2048,
         memory_size=64,
         write_stride=4,
         use_rag_memory=True,
@@ -45,6 +47,8 @@ class scoring_head(nn.Module):
         rag_memory_dropout=0.1,
     ):
         super().__init__()
+        self.use_static_branch = use_static_branch
+        self.static_in_dim = static_in_dim
 
 
         self.init_memory_key = nn.parameter.Parameter(torch.randn(1, dim))
@@ -85,12 +89,18 @@ class scoring_head(nn.Module):
         self.register_buffer("rag_memory_count", torch.zeros(1, dtype=torch.long))
         self.register_buffer("rag_memory_ptr", torch.zeros(1, dtype=torch.long))
 
-        # time-wise scoring head: 2 hidden layers MLP applied on each timestep feature
+        # time-wise scoring head: applied on each timestep fused feature
         # input: [B, T, dim] -> output: [B, T, num_scores]
         hidden1 = dim
         hidden2 = max(dim // 2, 1)
+
+        fused_dim = dim * 2 if self.use_static_branch else dim
+        if self.use_static_branch:
+            # Project static embedding to the same dim as dynamic embedding before concat.
+            self.static_proj = nn.Linear(static_in_dim, dim)
+
         self.time_score_mlp = nn.Sequential(
-            nn.Linear(dim, hidden1),
+            nn.Linear(fused_dim, hidden1),
             nn.GELU(),
             nn.Linear(hidden1, hidden2),
             nn.GELU(),
@@ -157,7 +167,16 @@ class scoring_head(nn.Module):
                 if self.rag_memory_count[0] < self.rag_memory_capacity:
                     self.rag_memory_count[0] += 1
 
-    def forward(self, audio_feature, video_feature, inv_audio_feature, inv_video_feature, audio_len, video_len):
+    def forward(
+        self,
+        audio_feature,
+        video_feature,
+        inv_audio_feature,
+        inv_video_feature,
+        audio_len,
+        video_len,
+        static_feature=None,
+    ):
         batch_size, aclip, _, _ = audio_feature.shape
         batch_size, vclip, _, _ = video_feature.shape
         clip = min(aclip, vclip)
@@ -205,6 +224,13 @@ class scoring_head(nn.Module):
 
             # do NOT average over time; average cl/bk_cl at each timestep
             time_feat = (cl + bk_cl) / 2  # [1, T, dim]
+
+            if self.use_static_branch:
+                if static_feature is None:
+                    raise ValueError("static_feature must be provided when use_static_branch=True")
+                static_time_feat = static_feature[i:i+1, :curr_batch_len]  # [1, T, static_in_dim]
+                static_time_feat = self.static_proj(static_time_feat)  # [1, T, dim]
+                time_feat = torch.cat([time_feat, static_time_feat], dim=-1)  # [1, T, 2*dim]
 
             # MLP predicts score per timestep, then aggregate to scalar score
             time_score = self.time_score_mlp(time_feat).squeeze(-1)  # [1, T]

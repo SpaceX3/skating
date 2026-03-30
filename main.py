@@ -1,17 +1,12 @@
-from typing_extensions import final
+import argparse
 import torch
 import torch.utils.data as data
-import os
 import numpy as np
-from model import scoring_head, head
-from dataset.dataset_fs800 import FeatureDataset, av_collate_fn
+from model import scoring_head
+from dataset.dataset_fs800 import FeatureDatasetWithStaticCache, av_collate_fn_with_static
 from scipy.stats import spearmanr 
-import math
-# from torch.optim import lr_sheduler
-# import time
-# import warnings
 
-dev = 1
+dev = 0
 
 def validation(dataloader, model, criterion, score_index):
     model.eval()
@@ -20,16 +15,17 @@ def validation(dataloader, model, criterion, score_index):
     val_pred = []
 
 
-    for audio_feature, video_feature, inv_audio_feature, inv_video_feature, audio_len, video_len, score, data_index in dataloader:
+    for audio_feature, video_feature, inv_audio_feature, inv_video_feature, static_feature, audio_len, video_len, score, data_index in dataloader:
         batch_size, _, _, _ = audio_feature.shape
         audio_feature = audio_feature.cuda(device=dev)
         video_feature = video_feature.cuda(device=dev)
         inv_audio_feature = inv_audio_feature.cuda(device=dev)
         inv_video_feature = inv_video_feature.cuda(device=dev)
+        static_feature = static_feature.cuda(device=dev)
         target = score[score_index].cuda(device=dev)
 
         with torch.no_grad():
-            output = model(audio_feature, video_feature, inv_audio_feature, inv_video_feature, audio_len, video_len)
+            output = model(audio_feature, video_feature, inv_audio_feature, inv_video_feature, audio_len, video_len, static_feature)
         val_pred.append(output.detach().data.cpu().numpy())
         val_truth.append(target.cpu().numpy())
 
@@ -45,15 +41,43 @@ def validation(dataloader, model, criterion, score_index):
     return val_loss, spear.correlation
 
 if __name__ == '__main__':
-    # build dataset
-    train_dataset = FeatureDataset(root_path = '../FS1000 Dataset/', is_train = True)
-    val_dataset = FeatureDataset(root_path = '../FS1000 Dataset/', is_train = False)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--gpu", type=int, default=dev)
+    parser.add_argument("--num_workers", type=int, default=8)
+    parser.add_argument("--strict_static_cache", action="store_true")
+    parser.add_argument("--allow_missing_static_cache", action="store_true")
+    args = parser.parse_args()
 
-    train_dataloader = data.DataLoader(dataset=train_dataset, batch_size=16, num_workers=8, shuffle=True, collate_fn=av_collate_fn)
-    val_dataloader = data.DataLoader(dataset=val_dataset, batch_size=16, num_workers=8, collate_fn=av_collate_fn)
+    dev = args.gpu
+
+    # build dataset
+    train_dataset = FeatureDatasetWithStaticCache(
+        root_path='../FS1000 Dataset/',
+        is_train=True,
+        strict_cache=(not args.allow_missing_static_cache),
+    )
+    val_dataset = FeatureDatasetWithStaticCache(
+        root_path='../FS1000 Dataset/',
+        is_train=False,
+        strict_cache=(not args.allow_missing_static_cache),
+    )
+
+    train_dataloader = data.DataLoader(
+        dataset=train_dataset,
+        batch_size=16,
+        num_workers=args.num_workers,
+        shuffle=True,
+        collate_fn=av_collate_fn_with_static,
+    )
+    val_dataloader = data.DataLoader(
+        dataset=val_dataset,
+        batch_size=16,
+        num_workers=args.num_workers,
+        collate_fn=av_collate_fn_with_static,
+    )
 
     # model
-    model = scoring_head(depth=2, input_dim=768, dim=512, input_len=16, num_scores=1).cuda(device=dev)  #, bidirection=True
+    model = scoring_head(depth=2, input_dim=768, dim=512, input_len=16, num_scores=1, use_static_branch=True, static_in_dim=2048).cuda(device=dev)  #, bidirection=True
 
     epochs = 100
     warm_up_epochs = 10
@@ -79,19 +103,20 @@ if __name__ == '__main__':
         train_truth = []
         train_pred = []
         
-        for audio_feature, video_feature, inv_audio_feature, inv_video_feature, audio_len, video_len, score, data_index in train_dataloader:
+        for audio_feature, video_feature, inv_audio_feature, inv_video_feature, static_feature, audio_len, video_len, score, data_index in train_dataloader:
             batch_size, _, _, _ = audio_feature.shape
             audio_feature = audio_feature.cuda(device=dev)
             video_feature = video_feature.cuda(device=dev)
             inv_audio_feature = inv_audio_feature.cuda(device=dev)
             inv_video_feature = inv_video_feature.cuda(device=dev)
+            static_feature = static_feature.cuda(device=dev)
             
             target = score[score_index].cuda(device=dev)
 
             train_loss = 0
             optimizer.zero_grad()
 
-            output = model(audio_feature, video_feature, inv_audio_feature, inv_video_feature, audio_len, video_len)
+            output = model(audio_feature, video_feature, inv_audio_feature, inv_video_feature, audio_len, video_len, static_feature)
 
             loss = criterion(output, target)
             train_loss = loss.item()
