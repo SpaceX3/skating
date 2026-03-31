@@ -6,7 +6,7 @@ import torch
 from torch import nn
 
 
-def load_videoswin_backbone(device: str = "cuda:0", ckpt_dir: str = "./videomae-base-finetuned-ucf101"):
+def load_videoswin_backbone(device: str = "cuda:0", ckpt_dir: str = "./model/videomae-base-finetuned-ucf101"):
     """
     实际使用本地的 VideoMAE-base（finetuned UCF101）作为视频编码 backbone。
     通过 transformers 从本地目录加载，不访问网络。
@@ -163,7 +163,7 @@ def main():
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--clip_len", type=float, default=5.0)
     parser.add_argument("--overlap_ratio", type=float, default=0.5)
-    parser.add_argument("--ckpt_dir", type=str, default="./videomae-base-finetuned-ucf101",
+    parser.add_argument("--ckpt_dir", type=str, default="./model/videomae-base-finetuned-ucf101",
                         help="本地 VideoMAE-base 权重目录，包含 config.json / pytorch_model.bin 等")
     args = parser.parse_args()
 
