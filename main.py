@@ -8,10 +8,11 @@ from scipy.stats import spearmanr
 
 dev = 0
 
-def set_trainable_params_for_stage(model, freeze_dynamic_backbone):
+def set_trainable_params_for_stage(model, freeze_dynamic_backbone, freeze_static_proj_in_stage2=False):
     """
     Stage-1: only train static projection and time scoring head.
-    Stage-2: train all params.
+    Stage-2: train dynamic backbone + time scoring head.
+             Optionally freeze static projection to keep static branch fixed.
     """
     if freeze_dynamic_backbone:
         for name, param in model.named_parameters():
@@ -20,11 +21,35 @@ def set_trainable_params_for_stage(model, freeze_dynamic_backbone):
             else:
                 param.requires_grad = False
     else:
-        for _, param in model.named_parameters():
-            param.requires_grad = True
+        for name, param in model.named_parameters():
+            if freeze_static_proj_in_stage2 and ("static_proj" in name):
+                param.requires_grad = False
+            else:
+                param.requires_grad = True
 
 
-def build_optimizer_and_scheduler(model, lr=1e-4, weight_decay=1e-4):
+def build_optimizer_and_scheduler(model, lr=1e-4, weight_decay=1e-4, stage2_param_groups=False):
+    if stage2_param_groups:
+        time_head_params = []
+        backbone_params = []
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if "time_score_mlp" in name:
+                time_head_params.append(p)
+            else:
+                backbone_params.append(p)
+
+        param_groups = []
+        if backbone_params:
+            param_groups.append({"params": backbone_params, "lr": lr})
+        if time_head_params:
+            # Slightly higher lr for final regressor head in stage-2.
+            param_groups.append({"params": time_head_params, "lr": lr * 2.0})
+        optimizer = torch.optim.Adam(param_groups, weight_decay=weight_decay)
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=15, gamma=0.5)
+        return optimizer, scheduler
+
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.Adam(trainable_params, lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=15, gamma=0.5)
@@ -68,7 +93,8 @@ if __name__ == '__main__':
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--strict_static_cache", action="store_true")
     parser.add_argument("--allow_missing_static_cache", action="store_true")
-    parser.add_argument("--freeze_dynamic_epochs", type=int, default=50)
+    parser.add_argument("--freeze_dynamic_epochs", type=int, default=20)
+    parser.add_argument("--freeze_static_in_stage2", action="store_true")
     args = parser.parse_args()
 
     dev = args.gpu
@@ -110,7 +136,7 @@ if __name__ == '__main__':
         static_in_dim=2048,
         static_proj_dim=128,
         fusion_dropout=0.3,
-        time_mlp_dropout=0.3,
+        time_mlp_dropout=0.1,
     ).cuda(device=dev)  #, bidirection=True
 
     epochs = 100
@@ -118,7 +144,11 @@ if __name__ == '__main__':
     # two-stage training:
     # stage-1 freezes dynamic backbone and only trains static projection + regression head
     freeze_dynamic_epochs = max(args.freeze_dynamic_epochs, 0)
-    set_trainable_params_for_stage(model, freeze_dynamic_backbone=(freeze_dynamic_epochs > 0))
+    set_trainable_params_for_stage(
+        model,
+        freeze_dynamic_backbone=(freeze_dynamic_epochs > 0),
+        freeze_static_proj_in_stage2=False,
+    )
     optimizer, scheduler = build_optimizer_and_scheduler(model, lr=1e-4, weight_decay=1e-4)
     if freeze_dynamic_epochs > 0:
         print(f"Stage-1 enabled: freeze dynamic backbone for first {freeze_dynamic_epochs} epochs.")
@@ -131,16 +161,28 @@ if __name__ == '__main__':
 
     min_val_loss = 10000
     max_spear_cor = 0
-    patience = 10
+    patience = 15
     no_improve_epochs = 0
 
     model.train()
 
     for epoch_idx in range(epochs):
         if freeze_dynamic_epochs > 0 and epoch_idx == freeze_dynamic_epochs:
-            set_trainable_params_for_stage(model, freeze_dynamic_backbone=False)
-            optimizer, scheduler = build_optimizer_and_scheduler(model, lr=1e-4, weight_decay=1e-4)
-            print("Stage-2 enabled: unfreeze all parameters and continue joint training.")
+            set_trainable_params_for_stage(
+                model,
+                freeze_dynamic_backbone=False,
+                freeze_static_proj_in_stage2=args.freeze_static_in_stage2,
+            )
+            optimizer, scheduler = build_optimizer_and_scheduler(
+                model,
+                lr=1e-4,
+                weight_decay=1e-4,
+                stage2_param_groups=True,
+            )
+            if args.freeze_static_in_stage2:
+                print("Stage-2 enabled: train dynamic backbone + time head, keep static_proj frozen.")
+            else:
+                print("Stage-2 enabled: unfreeze all parameters and continue joint training.")
 
         print("="*25)
         print("epoch ", epoch_idx)
