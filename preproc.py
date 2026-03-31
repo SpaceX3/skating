@@ -6,82 +6,48 @@ import torch
 from torch import nn
 
 
-def load_videoswin_backbone(device: str = "cuda:0", model_name: str = "swinv2_base_window12to16_192to256.ms_in22k_ft_in1k", ckpt_dir: str = None):
+def load_videoswin_backbone(device: str = "cuda:0", ckpt_dir: str = "./videomae-base-finetuned-ucf101"):
     """
-    从本地权重加载 Video Swin Transformer backbone，不访问网络。
-
-    - model_name: timm 中的模型名（需与你权重对应）
-    - ckpt_dir: 存放 model.safetensors / pytorch_model.bin 的目录
+    实际使用本地的 VideoMAE-base（finetuned UCF101）作为视频编码 backbone。
+    通过 transformers 从本地目录加载，不访问网络。
     """
     try:
-        import timm
+        from transformers import VideoMAEModel, AutoImageProcessor
     except ImportError:
-        raise ImportError("需要安装 timm 库以使用 Video Swin Transformer，例如: pip install timm")
+        raise ImportError("需要安装 transformers 库以使用 VideoMAE，例如: pip install transformers")
 
-    # 不使用 pretrained=True，避免联网下载
-    model = timm.create_model(model_name, pretrained=False)
-    if hasattr(model, "head"):
-        model.head = nn.Identity()
-
-    # 从本地 safetensors 或 bin 加载权重
-    if ckpt_dir is not None:
-        from glob import glob
-        from os.path import join, exists
-
-        safetensor_files = glob(os.path.join(ckpt_dir, "*.safetensors"))
-        bin_files = glob(os.path.join(ckpt_dir, "*.bin"))
-
-        state_dict = None
-        if safetensor_files:
-            try:
-                from safetensors.torch import load_file
-            except ImportError:
-                raise ImportError("检测到本地有 model.safetensors，但未安装 safetensors：pip install safetensors")
-            ckpt_path = safetensor_files[0]
-            print(f"[preproc] loading safetensors weights from {ckpt_path}")
-            state_dict = load_file(ckpt_path)
-        elif bin_files:
-            ckpt_path = bin_files[0]
-            print(f"[preproc] loading bin weights from {ckpt_path}")
-            state = torch.load(ckpt_path, map_location="cpu")
-            # 兼容 HuggingFace 格式
-            if isinstance(state, dict) and "state_dict" in state:
-                state_dict = state["state_dict"]
-            else:
-                state_dict = state
-
-        if state_dict is not None:
-            # 有些权重会带有前缀，比如 "backbone."，这里使用 strict=False 以增加兼容性
-            missing, unexpected = model.load_state_dict(state_dict, strict=False)
-            if missing:
-                print(f"[preproc][warn] missing keys when loading ckpt: {len(missing)}")
-            if unexpected:
-                print(f"[preproc][warn] unexpected keys when loading ckpt: {len(unexpected)}")
-        else:
-            print(f"[preproc][warn] 未在 {ckpt_dir} 中找到 .safetensors 或 .bin 权重，将使用随机初始化权重。")
-
+    processor = AutoImageProcessor.from_pretrained(ckpt_dir, local_files_only=True)
+    model = VideoMAEModel.from_pretrained(ckpt_dir, local_files_only=True)
     model.eval().to(device)
-    return model
+    return processor, model
 
 
-def extract_videoswin_feature(model, video_tensor: torch.Tensor, device: str = "cuda:0") -> torch.Tensor:
+def extract_videoswin_feature(backbone, video_tensor: torch.Tensor, device: str = "cuda:0") -> torch.Tensor:
     """
-    使用 SwinV2 图像 backbone 对一个 clip 的多帧提特征，并在时间维上做平均。
+    使用 VideoMAE 对一个 clip 的多帧提特征。
     video_tensor: [T, C, H, W]
-    返回: [D]，其中 D 目标为 768。
+    返回: [D]，通常 D=768。
     """
+    processor, model = backbone
+
     if video_tensor.dim() != 4:
         raise ValueError("video_tensor 期望维度为 [T, C, H, W]")
 
-    # 当前使用的是 2D SwinV2（图像分类），输入应为 [B, C, H, W]。
-    # 这里按帧分别提特征，再在时间维上平均。
-    x = video_tensor.to(device)  # [T,C,H,W]
+    # 转成 list[H,W,C]，让 VideoMAE 的 processor 处理
+    frames = (video_tensor * 255.0).clamp(0, 255).byte().permute(0, 2, 3, 1).cpu().numpy()  # [T,H,W,C]
+
+    from transformers import VideoMAEImageProcessor  # 仅类型提示用
+
+    inputs = processor(list(frames), return_tensors="pt")
+    pixel_values = inputs["pixel_values"].to(device)  # [1, C, T, H, W]
+
     with torch.no_grad():
-        feat = model(x)  # [T,D]
-    if feat.dim() == 1:
-        return feat.cpu()
-    feat_mean = feat.mean(dim=0)  # [D]
-    return feat_mean.cpu()
+        outputs = model(pixel_values=pixel_values)
+        # 使用 CLS token 作为 clip 特征
+        last_hidden = outputs.last_hidden_state  # [B, num_tokens, D]
+        cls_feat = last_hidden[:, 0]  # [B, D]
+
+    return cls_feat.squeeze(0).cpu()  # [D]
 
 
 def read_video_clip(cap, start_sec: float, end_sec: float, target_fps: float = 8.0, size=(256, 256)):
@@ -197,12 +163,12 @@ def main():
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--clip_len", type=float, default=5.0)
     parser.add_argument("--overlap_ratio", type=float, default=0.5)
-    parser.add_argument("--model_name", type=str, default="swinv2_base_window12to16_192to256.ms_in22k_ft_in1k")
-    parser.add_argument("--ckpt_dir", type=str, default=None, help="包含 model.safetensors / pytorch_model.bin 的本地目录")
+    parser.add_argument("--ckpt_dir", type=str, default="./videomae-base-finetuned-ucf101",
+                        help="本地 VideoMAE-base 权重目录，包含 config.json / pytorch_model.bin 等")
     args = parser.parse_args()
 
     device = f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu"
-    model = load_videoswin_backbone(device=device, model_name=args.model_name, ckpt_dir=args.ckpt_dir)
+    model = load_videoswin_backbone(device=device, ckpt_dir=args.ckpt_dir)
 
     def process_split(split_name: str):
         txt_path = os.path.join(args.root, f"{split_name}_fs800.txt")
