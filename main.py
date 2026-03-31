@@ -98,14 +98,14 @@ if __name__ == '__main__':
 
     # two-stage training: stage-1 only trains time_score_mlp, stage-2 trains all params
     freeze_backbone_epochs = 30
-    freeze_static_proj_in_stage2 = True
+    freeze_static_proj_in_stage2 = False
     set_trainable_params_for_stage(
         model,
         stage=1 if freeze_backbone_epochs > 0 else 2,
         freeze_static_proj_in_stage2=freeze_static_proj_in_stage2
     )
     optimizer, scheduler = build_optimizer_and_scheduler(
-        model, lr=1e-4, weight_decay=5e-6, step_size=20, gamma=0.7
+        model, lr=1e-4, weight_decay=5e-6, step_size=30, gamma=0.9
     )
     if freeze_backbone_epochs > 0:
         print(f"Stage-1 enabled: train only time_score_mlp for first {freeze_backbone_epochs} epochs.")
