@@ -29,8 +29,9 @@ class PreNormResidual(nn.Module):
         return self.fn(self.norm(x)) + x
 
 class scoring_head(nn.Module):
-    def __init__(self, depth, input_dim, dim, input_len=2, num_scores=1):
+    def __init__(self, depth, input_dim, dim, input_len=2, num_scores=1, use_static_branch=False, static_in_dim=2048, static_proj_dim=128):
         super().__init__()
+        self.use_static_branch = use_static_branch
 
 
         self.hidden_state = nn.parameter.Parameter(torch.randn(1, dim))
@@ -53,8 +54,11 @@ class scoring_head(nn.Module):
         # input: [B, T, dim] -> output: [B, T, num_scores]
         hidden1 = dim // 2
         hidden2 = max(dim // 4, 1)
+        fused_dim = dim + static_proj_dim if self.use_static_branch else dim
+        if self.use_static_branch:
+            self.static_proj = nn.Linear(static_in_dim, static_proj_dim)
         self.time_score_mlp = nn.Sequential(
-            nn.Linear(dim, hidden1),
+            nn.Linear(fused_dim, hidden1),
             nn.GELU(),
             nn.Linear(hidden1, hidden2),
             nn.GELU(),
@@ -65,7 +69,7 @@ class scoring_head(nn.Module):
         # self.video_transform_linear = nn.Linear(input_dim, dim)
         # self.audio_transform_linear = nn.Linear(input_dim, dim)
 
-    def forward(self, audio_feature, video_feature, inv_audio_feature, inv_video_feature, audio_len, video_len):
+    def forward(self, audio_feature, video_feature, inv_audio_feature, inv_video_feature, audio_len, video_len, static_feature=None):
         batch_size, aclip, _, _ = audio_feature.shape
         batch_size, vclip, _, _ = video_feature.shape
         clip = min(aclip, vclip)
@@ -114,6 +118,12 @@ class scoring_head(nn.Module):
 
             # do NOT average over time; average cl/bk_cl at each timestep
             time_feat = (cl + bk_cl) / 2  # [1, T, dim]
+            if self.use_static_branch:
+                if static_feature is None:
+                    raise ValueError("static_feature must be provided when use_static_branch=True")
+                static_time_feat = static_feature[i:i+1, :curr_batch_len]
+                static_time_feat = self.static_proj(static_time_feat)
+                time_feat = torch.cat([time_feat, static_time_feat], dim=-1)
 
             # MLP predicts score per timestep, then aggregate to scalar score
             time_score = self.time_score_mlp(time_feat).squeeze(-1)  # [1, T]
