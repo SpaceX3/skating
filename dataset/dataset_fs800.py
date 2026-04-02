@@ -140,7 +140,8 @@ class FeatureDatasetWithStaticCache(data.Dataset):
         data_index = data_info[0]
 
         audio_path = "../FS1000 Dataset/new feature/ast_feature_fs1000_new/" + data_index + '.npy'
-        video_path = "../FS1000 Dataset/Timesformer_output_feature_fs800/" + data_index + '.npy'
+        video_path = "../FS1000 Dataset/VST_feature_fs800/" + data_index + '.npy'
+        # "../FS1000 Dataset/Timesformer_output_feature_fs800/" + data_index + '.npy'
         audio_feature = torch.from_numpy(np.load(audio_path))
         video_feature = torch.from_numpy(np.load(video_path))
 
