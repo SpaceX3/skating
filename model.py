@@ -18,6 +18,20 @@ def FeedForward(dim, expansion_factor = 4, dropout = 0., dense = nn.Linear):
         nn.Dropout(dropout)
     )
 
+class TokenSelfAttention(nn.Module):
+    def __init__(self, dim, num_heads=8, attn_dropout=0.1):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(
+            embed_dim=dim,
+            num_heads=num_heads,
+            dropout=attn_dropout,
+            batch_first=True,
+        )
+
+    def forward(self, x):
+        out, _ = self.attn(x, x, x, need_weights=False)
+        return out
+
 class PreNormResidual(nn.Module):
     def __init__(self, dim, fn, transpose=False):
         super().__init__()
@@ -29,7 +43,7 @@ class PreNormResidual(nn.Module):
         return self.fn(self.norm(x)) + x
 
 class scoring_head(nn.Module):
-    def __init__(self, depth, input_dim, dim, input_len=2, num_scores=1, use_static_branch=False, static_in_dim=2048, static_proj_dim=128):
+    def __init__(self, depth, input_dim, dim, input_len=2, num_scores=1, use_static_branch=False, static_in_dim=2048, static_proj_dim=128, use_attention_mixing=True, num_heads=8, attn_dropout=0.3):
         super().__init__()
         self.use_static_branch = use_static_branch
 
@@ -39,11 +53,18 @@ class scoring_head(nn.Module):
 
         self.linear1 = nn.Linear(input_dim, dim)
         
-        self.linear_forward = nn.Sequential(
-            *[nn.Sequential(
-                PreNormResidual(dim, FeedForward((input_len + 2), dense = partial(nn.Conv1d, kernel_size=1))),  # token mixing
-                PreNormResidual(dim, FeedForward(dim))) for _ in range(depth)]    # channel mixing
-        )
+        if use_attention_mixing:
+            self.linear_forward = nn.Sequential(
+                *[nn.Sequential(
+                    PreNormResidual(dim, TokenSelfAttention(dim, num_heads=num_heads, attn_dropout=attn_dropout)),  # token mixing by attention
+                    PreNormResidual(dim, FeedForward(dim))) for _ in range(depth)]    # channel mixing
+            )
+        else:
+            self.linear_forward = nn.Sequential(
+                *[nn.Sequential(
+                    PreNormResidual(dim, FeedForward((input_len + 2), dense = partial(nn.Conv1d, kernel_size=1))),  # token mixing by conv1d
+                    PreNormResidual(dim, FeedForward(dim))) for _ in range(depth)]    # channel mixing
+            )
 
         self.layer_norm = nn.LayerNorm(dim)
 

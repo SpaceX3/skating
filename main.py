@@ -88,16 +88,16 @@ if __name__ == '__main__':
         dim=512,
         input_len=16,
         num_scores=1,
-        use_static_branch=True,
+        use_static_branch=False,
         static_in_dim=2048,
         static_proj_dim=128,
     ).cuda(device=dev)  #, bidirection=True
 
-    epochs = 200
+    epochs = 1000
     warm_up_epochs = 10
 
     # two-stage training: stage-1 only trains time_score_mlp, stage-2 trains all params
-    freeze_backbone_epochs = 30
+    freeze_backbone_epochs = 0
     freeze_static_proj_in_stage2 = False
     set_trainable_params_for_stage(
         model,
@@ -105,7 +105,7 @@ if __name__ == '__main__':
         freeze_static_proj_in_stage2=freeze_static_proj_in_stage2
     )
     optimizer, scheduler = build_optimizer_and_scheduler(
-        model, lr=1e-4, weight_decay=5e-6, step_size=30, gamma=0.9
+        model, lr=1e-4, weight_decay=5e-6, step_size=30, gamma=0.7
     )
     if freeze_backbone_epochs > 0:
         print(f"Stage-1 enabled: train only time_score_mlp for first {freeze_backbone_epochs} epochs.")
@@ -114,7 +114,7 @@ if __name__ == '__main__':
     criterion = torch.nn.MSELoss()
 
     # other parameter
-    score_index = 1
+    score_index = 0
 
     min_val_loss = 10000
     max_spear_cor = 0
