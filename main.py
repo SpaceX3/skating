@@ -114,7 +114,7 @@ if __name__ == '__main__':
     criterion = torch.nn.MSELoss()
 
     # other parameter
-    score_index = 1
+    score_index = 2
 
     min_val_loss = 10000
     max_spear_cor = 0
