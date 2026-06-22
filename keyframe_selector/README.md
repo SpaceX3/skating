@@ -36,7 +36,10 @@ python -u keyframe_selector/select_keyframes.py \
   --sample-fps 3 \
   --event-fps 2 \
   --pose-backend auto \
+  --gpu auto \
   --pose-batch-size 8 \
+  --decode-backend auto \
+  --flow-backend auto \
   --decode-backend auto \
   --flow-backend auto \
   --frames-only \
@@ -74,3 +77,8 @@ implementation.
 `--decode-backend auto` tries GPU NVDEC through Decord first and falls back to
 OpenCV if unavailable. `--flow-backend auto` tries OpenCV CUDA Farneback and
 falls back to CPU if the installed OpenCV was not built with CUDA.
+`--decode-backend auto` tries GPU NVDEC through Decord first and falls back to
+OpenCV if unavailable. `--flow-backend auto` tries OpenCV CUDA Farneback and
+falls back to CPU if the installed OpenCV was not built with CUDA.
+Use `--gpu auto` to select the visible GPU with the most free memory, `--gpu 2`
+to pin the run to physical GPU 2, or `--gpu cpu` to disable GPU pose/decode.

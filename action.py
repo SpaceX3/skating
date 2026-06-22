@@ -317,7 +317,7 @@ if __name__ == "__main__":
     parser.add_argument("--allow_missing_keyframes", action="store_true", help="Allow fallback to original random/center frame sampling.")
     parser.add_argument("--only_data_index", type=str, default=None)
     parser.add_argument("--limit", type=int, default=None)
-    parser.add_argument("--proxy", type=str, default=None, help="Optional HTTP/HTTPS proxy, e.g. http://127.0.0.1:6518")
+    parser.add_argument("--proxy", type=str, default=None, help="Optional HTTP/HTTPS proxy, e.g. http://127.0.0.1:7890")
     args = parser.parse_args()
 
     if args.proxy:

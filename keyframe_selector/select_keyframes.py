@@ -4,10 +4,11 @@ import argparse
 import csv
 import math
 import os
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import cv2
 import numpy as np
@@ -62,6 +63,123 @@ class JumpEvent:
 
 
 LOWER_BODY_KPTS = (11, 12, 13, 14, 15, 16)  # COCO hips, knees, ankles.
+
+
+def _visible_cuda_device_ids() -> Optional[Set[int]]:
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if not visible:
+        return None
+    if visible in {"-1", "NoDevFiles"}:
+        return set()
+    ids: Set[int] = set()
+    for item in visible.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if not item.isdigit():
+            return None
+        ids.add(int(item))
+    return ids
+
+
+def _query_nvidia_smi() -> List[Dict[str, int]]:
+    try:
+        output = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,memory.free,memory.total,utilization.gpu",
+                "--format=csv,noheader,nounits",
+            ],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        return []
+
+    gpus: List[Dict[str, int]] = []
+    for line in output.splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) != 4:
+            continue
+        try:
+            gpus.append(
+                {
+                    "index": int(parts[0]),
+                    "memory_free": int(parts[1]),
+                    "memory_total": int(parts[2]),
+                    "utilization": int(parts[3]),
+                }
+            )
+        except ValueError:
+            continue
+    return gpus
+
+
+def _select_auto_gpu() -> Optional[Dict[str, int]]:
+    gpus = _query_nvidia_smi()
+    visible_ids = _visible_cuda_device_ids()
+    if visible_ids is not None:
+        gpus = [gpu for gpu in gpus if gpu["index"] in visible_ids]
+    if not gpus:
+        return None
+    return max(gpus, key=lambda gpu: (gpu["memory_free"], -gpu["utilization"], gpu["memory_total"]))
+
+
+def configure_gpu_selection(args: argparse.Namespace) -> None:
+    gpu_arg = getattr(args, "gpu", None)
+    if gpu_arg is None:
+        return
+
+    gpu_text = str(gpu_arg).strip().lower()
+    if not gpu_text:
+        return
+
+    if gpu_text in {"cpu", "none", "-1"}:
+        os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+        args.device = "cpu"
+        args.decode_device = 0
+        if args.decode_backend in {"auto", "decord-gpu"}:
+            args.decode_backend = "decord-cpu"
+        if args.flow_backend in {"auto", "cuda"}:
+            args.flow_backend = "cpu"
+        print("[gpu] CPU mode selected; pose runs on cpu, decode uses decord-cpu, flow uses cpu.")
+        return
+
+    selected_info: Optional[Dict[str, int]] = None
+    if gpu_text == "auto":
+        selected_info = _select_auto_gpu()
+        if selected_info is None:
+            print(
+                "[gpu][warn] --gpu auto could not query nvidia-smi; "
+                f"keeping device={args.device}, decode_device={args.decode_device}."
+            )
+            return
+        selected_gpu = selected_info["index"]
+    else:
+        if gpu_text.startswith("cuda:"):
+            gpu_text = gpu_text.split(":", 1)[1]
+        if not gpu_text.isdigit():
+            raise ValueError("--gpu must be an integer GPU id, 'auto', or 'cpu'")
+        selected_gpu = int(gpu_text)
+        for info in _query_nvidia_smi():
+            if info["index"] == selected_gpu:
+                selected_info = info
+                break
+
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(selected_gpu)
+    args.device = "cuda:0"
+    args.decode_device = 0
+    details = ""
+    if selected_info is not None:
+        details = (
+            f", free={selected_info['memory_free']}MiB/"
+            f"{selected_info['memory_total']}MiB, util={selected_info['utilization']}%"
+        )
+    print(
+        "[gpu] selected physical GPU "
+        f"{selected_gpu} -> CUDA_VISIBLE_DEVICES={selected_gpu}, "
+        f"pose_device={args.device}, decode_device={args.decode_device}{details}"
+    )
 
 
 class PoseEstimator:
@@ -1933,6 +2051,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
+    configure_gpu_selection(args)
     if bool(args.video) == bool(args.video_root):
         raise ValueError("provide exactly one of --video or --video-root")
     if not 0.0 <= args.blur_quantile <= 1.0:
