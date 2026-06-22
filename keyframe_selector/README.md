@@ -37,6 +37,8 @@ python -u keyframe_selector/select_keyframes.py \
   --event-fps 2 \
   --pose-backend auto \
   --pose-batch-size 8 \
+  --decode-backend auto \
+  --flow-backend auto \
   --frames-only \
   --skip-existing \
   --continue-on-error \
@@ -69,3 +71,6 @@ the full run can keep the same `--sample-fps` and `--event-fps` while avoiding
 repeated frame decoding, Laplacian, frame-difference, and optical-flow work.
 Use `--disable-candidate-cache` only for debugging against the old per-window
 implementation.
+`--decode-backend auto` tries GPU NVDEC through Decord first and falls back to
+OpenCV if unavailable. `--flow-backend auto` tries OpenCV CUDA Farneback and
+falls back to CPU if the installed OpenCV was not built with CUDA.
