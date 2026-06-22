@@ -3,11 +3,13 @@ import argparse
 import torch
 import torch.utils.data as data
 import os
+import sys
 import numpy as np
 from model import scoring_head, head
 from dataset.dataset_fs800 import FeatureDatasetWithStaticCache, av_collate_fn_with_static
 from scipy.stats import spearmanr 
 import math
+from datetime import datetime
 # from torch.optim import lr_sheduler
 # import time
 # import warnings
@@ -35,6 +37,53 @@ def build_optimizer_and_scheduler(model, lr=1e-4, weight_decay=5e-6, step_size=2
     optimizer = torch.optim.Adam(trainable_params, lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=step_size, gamma=gamma)
     return optimizer, scheduler
+
+
+def checkpoint_path(epoch_idx, val_loss, spear):
+    output_dir = "./fs800_result"
+    os.makedirs(output_dir, exist_ok=True)
+    return os.path.join(output_dir, "checkpoint_epoch{}_loss{:.2f}_spear{:.3f}.pth".format(
+        epoch_idx,
+        val_loss,
+        spear,
+    ))
+
+
+def save_best_checkpoint(model, save_path, previous_path):
+    torch.save(model.state_dict(), save_path)
+    if previous_path and previous_path != save_path and os.path.exists(previous_path):
+        os.remove(previous_path)
+    return save_path
+
+
+class Tee:
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data):
+        for stream in self.streams:
+            stream.write(data)
+            stream.flush()
+
+    def flush(self):
+        for stream in self.streams:
+            stream.flush()
+
+
+def setup_log_output(log_dir, log_file=None):
+    os.makedirs(log_dir, exist_ok=True)
+    if log_file is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_file = os.path.join(log_dir, f"train_{timestamp}.log")
+    else:
+        log_file = os.path.abspath(log_file)
+        os.makedirs(os.path.dirname(log_file) or ".", exist_ok=True)
+
+    log_stream = open(log_file, "a", buffering=1)
+    sys.stdout = Tee(sys.__stdout__, log_stream)
+    sys.stderr = Tee(sys.__stderr__, log_stream)
+    print(f"log file: {log_file}")
+    return log_stream
 
 def validation(dataloader, model, criterion, score_index):
     model.eval()
@@ -71,8 +120,11 @@ def validation(dataloader, model, criterion, score_index):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--gpu", type=int, default=dev)
+    parser.add_argument("--log-dir", default="./fs800_result")
+    parser.add_argument("--log-file", default=None)
     args = parser.parse_args()
     dev = args.gpu
+    log_stream = setup_log_output(args.log_dir, args.log_file)
 
     # build dataset
     train_dataset = FeatureDatasetWithStaticCache(root_path = '../FS1000 Dataset/', is_train = True)
@@ -118,6 +170,8 @@ if __name__ == '__main__':
 
     min_val_loss = 10000
     max_spear_cor = 0
+    best_loss_checkpoint = None
+    best_spear_checkpoint = None
 
     for epoch_idx in range(epochs):
         if freeze_backbone_epochs > 0 and epoch_idx == freeze_backbone_epochs:
@@ -168,12 +222,17 @@ if __name__ == '__main__':
         print("val_loss: ", val_loss, " | spear corr: ", spear)
         if val_loss < min_val_loss:
             min_val_loss = val_loss
-            
-            torch.save(model.state_dict(), "./fs800_result/checkpoint_pe.pth")
+            save_path = checkpoint_path(epoch_idx, val_loss, spear)
+            best_loss_checkpoint = save_best_checkpoint(model, save_path, best_loss_checkpoint)
+            print("saved best loss checkpoint: ", save_path)
         if spear > max_spear_cor:
             max_spear_cor = spear
+            save_path = checkpoint_path(epoch_idx, val_loss, spear)
+            best_spear_checkpoint = save_best_checkpoint(model, save_path, best_spear_checkpoint)
+            print("saved best spear checkpoint: ", save_path)
+            
         print("min validation loss: ", min_val_loss, " | max spear corr: ", max_spear_cor)
-        print("checkpoint_pe")
+        print("checkpoint")
         
         
         print(optimizer.param_groups[0]['lr'])

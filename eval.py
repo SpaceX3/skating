@@ -9,7 +9,7 @@ from scipy.stats import spearmanr
 from dataset.dataset_fs800 import FeatureDatasetWithStaticCache, av_collate_fn_with_static
 from model import scoring_head
 
-dev=1
+dev=0
 
 
 def load_state_dict(checkpoint_path, device):
