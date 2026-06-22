@@ -262,6 +262,12 @@ def precompute_split(
         if keyframe_file is not None:
             keyframe_rows = _read_keyframe_rows(keyframe_file)
             print(f"[action] {data_index}: using keyframes from {keyframe_file} ({len(keyframe_rows)} rows)")
+            if len(keyframe_rows) != T_dyn:
+                print(
+                    f"[action][warn] {data_index}: keyframe rows ({len(keyframe_rows)}) != T_dyn ({T_dyn}); "
+                    "mapping selected frames to dynamic timesteps. Use select_keyframes.py --num-segments "
+                    "or --feature-path to produce one keyframe per overlapping dynamic window."
+                )
         elif require_keyframes:
             raise FileNotFoundError(f"Missing keyframe file for {data_index} under {keyframe_root}")
         elif keyframe_root:

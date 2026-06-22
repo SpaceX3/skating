@@ -1007,6 +1007,60 @@ def write_frame_index_txt(path: Path, rows: Sequence[Dict[str, float]]) -> None:
             f.write(f"{int(row['frame_index'])}\n")
 
 
+def feature_segment_count(path: str) -> int:
+    arr = np.load(path, mmap_mode="r")
+    if arr.ndim == 0:
+        raise ValueError(f"feature array has no time dimension: {path}")
+    return int(arr.shape[0])
+
+
+def build_segment_windows(
+    duration: float,
+    clip_len: float,
+    num_segments: Optional[int] = None,
+    segment_stride: Optional[float] = None,
+) -> List[Tuple[int, float, float]]:
+    if clip_len <= 0:
+        raise ValueError("clip_len must be positive")
+    if duration <= 0:
+        return []
+
+    starts: List[float] = []
+    if num_segments is not None:
+        if num_segments <= 0:
+            raise ValueError("num_segments must be positive")
+        if segment_stride is not None:
+            if segment_stride <= 0:
+                raise ValueError("segment_stride must be positive")
+            starts = [i * segment_stride for i in range(num_segments)]
+        elif num_segments == 1:
+            starts = [0.0]
+        elif duration <= clip_len:
+            starts = [0.0 for _ in range(num_segments)]
+        else:
+            stride = (duration - clip_len) / float(num_segments - 1)
+            starts = [i * stride for i in range(num_segments)]
+    else:
+        stride = segment_stride if segment_stride is not None else clip_len
+        if stride <= 0:
+            raise ValueError("segment_stride must be positive")
+        t = 0.0
+        while t < duration:
+            starts.append(t)
+            t += stride
+
+    windows: List[Tuple[int, float, float]] = []
+    for idx, start in enumerate(starts):
+        if num_segments is not None and segment_stride is None and duration > clip_len:
+            start = min(start, duration - clip_len)
+        start = max(0.0, min(float(start), max(duration - 1e-6, 0.0)))
+        end = min(start + clip_len, duration)
+        if end <= start:
+            end = min(duration, start + 1e-6)
+        windows.append((idx, start, end))
+    return windows
+
+
 def make_contact_sheet(image_paths: Sequence[Path], out_path: Path, columns: int = 5, thumb_width: int = 360) -> None:
     if not image_paths:
         return
@@ -1071,20 +1125,43 @@ def select_keyframes(args: argparse.Namespace) -> None:
         proxy=args.proxy,
     )
 
-    num_segments = int(math.ceil(duration / args.clip_len))
+    num_segments_arg = args.num_segments
+    if args.feature_path:
+        feature_segments = feature_segment_count(args.feature_path)
+        if num_segments_arg is not None and num_segments_arg != feature_segments:
+            print(
+                "[warn] --num-segments differs from --feature-path length: "
+                f"{num_segments_arg} vs {feature_segments}; using --num-segments"
+            )
+        else:
+            num_segments_arg = feature_segments
+
+    windows = build_segment_windows(
+        duration=duration,
+        clip_len=args.clip_len,
+        num_segments=num_segments_arg,
+        segment_stride=args.segment_stride,
+    )
+    num_segments = len(windows)
     start_segment = max(0, args.start_segment)
     end_segment = num_segments
     if args.max_segments is not None:
         end_segment = min(end_segment, start_segment + args.max_segments)
+    selected_windows = windows[start_segment:end_segment]
+    effective_stride = selected_windows[1][1] - selected_windows[0][1] if len(selected_windows) > 1 else 0.0
 
     print(f"[video] {video_path}")
     print(f"[video] fps={fps:.3f}, frames={total_frames}, duration={duration:.2f}s")
-    print(f"[run] segments={start_segment}..{end_segment - 1}, clip_len={args.clip_len}s")
+    print(
+        f"[run] segments={start_segment}..{end_segment - 1}, "
+        f"count={len(selected_windows)}/{num_segments}, "
+        f"clip_len={args.clip_len}s, stride={effective_stride:.3f}s"
+    )
 
     jump_events: List[JumpEvent] = []
-    if not args.disable_jump_events:
-        analysis_start = max(0.0, start_segment * args.clip_len - args.event_margin_sec)
-        analysis_end = min(duration, end_segment * args.clip_len + args.event_margin_sec)
+    if not args.disable_jump_events and selected_windows:
+        analysis_start = max(0.0, min(window[1] for window in selected_windows) - args.event_margin_sec)
+        analysis_end = min(duration, max(window[2] for window in selected_windows) + args.event_margin_sec)
         print(
             "[jump] analyzing "
             f"{analysis_start:.2f}-{analysis_end:.2f}s at {args.event_fps:.2f} fps"
@@ -1127,9 +1204,7 @@ def select_keyframes(args: argparse.Namespace) -> None:
     selected_rows: List[Dict[str, float]] = []
     annotated_paths: List[Path] = []
 
-    for segment_idx in range(start_segment, end_segment):
-        seg_start = segment_idx * args.clip_len
-        seg_end = min((segment_idx + 1) * args.clip_len, duration)
+    for segment_idx, seg_start, seg_end in selected_windows:
         indices = candidate_indices(fps, total_frames, seg_start, seg_end, args.sample_fps)
         frames = read_frames(video_path, indices)
         if len(frames) != len(indices):
@@ -1230,6 +1305,26 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--video", required=True, help="Path to an input video.")
     parser.add_argument("--output-dir", required=True, help="Directory for selected frames and CSV files.")
     parser.add_argument("--clip-len", type=float, default=5.0, help="Segment length in seconds.")
+    parser.add_argument(
+        "--num-segments",
+        type=int,
+        default=None,
+        help=(
+            "Emit exactly this many keyframes. When set with --clip-len, windows overlap "
+            "by using an even stride so the first window starts at 0 and the last ends at the video end."
+        ),
+    )
+    parser.add_argument(
+        "--feature-path",
+        default="",
+        help="Optional .npy feature file; its first dimension is used as --num-segments.",
+    )
+    parser.add_argument(
+        "--segment-stride",
+        type=float,
+        default=None,
+        help="Optional explicit stride in seconds between segment starts.",
+    )
     parser.add_argument("--sample-fps", type=float, default=4.0, help="Candidate frame sampling rate.")
     parser.add_argument(
         "--blur-quantile",
@@ -1308,6 +1403,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         raise ValueError("--blur-quantile must be in [0, 1]")
     if not 0.0 <= args.jump_threshold_quantile <= 1.0:
         raise ValueError("--jump-threshold-quantile must be in [0, 1]")
+    if args.num_segments is not None and args.num_segments <= 0:
+        raise ValueError("--num-segments must be positive")
+    if args.segment_stride is not None and args.segment_stride <= 0:
+        raise ValueError("--segment-stride must be positive")
     select_keyframes(args)
     return 0
 

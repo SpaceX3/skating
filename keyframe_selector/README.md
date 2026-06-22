@@ -1,7 +1,9 @@
 # Keyframe Selector
 
 This directory is independent from the existing Skating-Mixer training code. It
-selects one static keyframe per 5-second video segment for visual inspection.
+selects one static keyframe per 5-second video window. For training
+preprocessing, pass `--feature-path` or `--num-segments` so the selector emits
+one keyframe for each overlapping dynamic feature timestep.
 
 The selector uses:
 
@@ -29,6 +31,7 @@ Example:
 conda run -n skating-mixer python keyframe_selector/select_keyframes.py `
   --video "D:\University\3fal\skate\FS1000 Dataset\fs1000\2019_Final_MS_Kevin.mp4" `
   --output-dir "D:\University\3fal\skate\skating-best\keyframe_selector\outputs\2019_Final_MS_Kevin" `
+  --feature-path "D:\University\3fal\skate\FS1000 Dataset\Timesformer_output_feature_fs800\2019_Final_MS_Kevin.npy" `
   --clip-len 5 `
   --sample-fps 4 `
   --pose-backend auto `
@@ -51,3 +54,8 @@ Use `--disable-jump-events` to reproduce the previous generic-only behavior.
 Use `--generic-use-pose` only if you also want the slower fallback scorer to
 run pose estimation; the two-stage jump logic uses pose without this flag.
 Use `--frames-only` when the output is meant for `action.py` preprocessing.
+Use `--feature-path path/to/Timesformer_feature.npy` or `--num-segments T_dyn`
+to preserve the original 5-second overlapping window count. Without these
+arguments, the script falls back to non-overlapping 5-second windows, which is
+useful for quick visual checks but produces fewer frame rows than the training
+feature sequence.
