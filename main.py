@@ -129,8 +129,16 @@ if __name__ == '__main__':
     parser.add_argument("--log-dir", default="./fs800_result")
     parser.add_argument("--log-file", default=None)
     parser.add_argument("--root-path", default="../FS1000 Dataset/")
-    parser.add_argument("--static-cache-dir-name", default="static_resnet50_cache")
-    parser.add_argument("--static-cache-prefix", default="static_resnet50")
+    parser.add_argument("--static-cache-dir-name", default="static_resnet50_keyframe_cache")
+    parser.add_argument("--static-cache-prefix", default="static_resnet50_keyframe")
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--num-workers", type=int, default=8)
+    parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--freeze-backbone-epochs", type=int, default=30)
+    parser.add_argument("--freeze-static-proj-in-stage2", action="store_true")
+    parser.add_argument("--score-index", type=int, default=0)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--weight-decay", type=float, default=5e-6)
     parser.add_argument("--only-data-index", default=None)
     parser.add_argument("--smoke-test", action="store_true")
     args = parser.parse_args()
@@ -153,9 +161,9 @@ if __name__ == '__main__':
         only_data_index=args.only_data_index,
     )
 
-    loader_workers = 0 if args.smoke_test else 8
-    train_dataloader = data.DataLoader(dataset=train_dataset, batch_size=16, num_workers=loader_workers, shuffle=(len(train_dataset) > 0), collate_fn=av_collate_fn_with_static)
-    val_dataloader = data.DataLoader(dataset=val_dataset, batch_size=16, num_workers=loader_workers, collate_fn=av_collate_fn_with_static)
+    loader_workers = 0 if args.smoke_test else args.num_workers
+    train_dataloader = data.DataLoader(dataset=train_dataset, batch_size=args.batch_size, num_workers=loader_workers, shuffle=(len(train_dataset) > 0), collate_fn=av_collate_fn_with_static)
+    val_dataloader = data.DataLoader(dataset=val_dataset, batch_size=args.batch_size, num_workers=loader_workers, collate_fn=av_collate_fn_with_static)
 
     if args.smoke_test:
         smoke_loader = train_dataloader if len(train_dataset) > 0 else val_dataloader
@@ -186,19 +194,19 @@ if __name__ == '__main__':
         static_proj_dim=128,
     ).cuda(device=dev)  #, bidirection=True
 
-    epochs = 200
+    epochs = args.epochs
     warm_up_epochs = 10
 
     # two-stage training: stage-1 only trains time_score_mlp, stage-2 trains all params
-    freeze_backbone_epochs = 30
-    freeze_static_proj_in_stage2 = False
+    freeze_backbone_epochs = args.freeze_backbone_epochs
+    freeze_static_proj_in_stage2 = args.freeze_static_proj_in_stage2
     set_trainable_params_for_stage(
         model,
         stage=1 if freeze_backbone_epochs > 0 else 2,
         freeze_static_proj_in_stage2=freeze_static_proj_in_stage2
     )
     optimizer, scheduler = build_optimizer_and_scheduler(
-        model, lr=1e-4, weight_decay=5e-6, step_size=30, gamma=0.9
+        model, lr=args.lr, weight_decay=args.weight_decay, step_size=30, gamma=0.9
     )
     if freeze_backbone_epochs > 0:
         print(f"Stage-1 enabled: train only time_score_mlp for first {freeze_backbone_epochs} epochs.")
@@ -207,7 +215,7 @@ if __name__ == '__main__':
     criterion = torch.nn.MSELoss()
 
     # other parameter
-    score_index = 0
+    score_index = args.score_index
 
     min_val_loss = 10000
     max_spear_cor = 0
@@ -218,9 +226,10 @@ if __name__ == '__main__':
         if freeze_backbone_epochs > 0 and epoch_idx == freeze_backbone_epochs:
             set_trainable_params_for_stage(model, stage=2, freeze_static_proj_in_stage2=freeze_static_proj_in_stage2)
             optimizer, scheduler = build_optimizer_and_scheduler(
-                model, lr=1e-4, weight_decay=5e-6, step_size=20, gamma=0.7
+                model, lr=args.lr, weight_decay=args.weight_decay, step_size=20, gamma=0.7
             )
-            print("Stage-2 enabled: train dynamic backbone + time head, keep static_proj frozen.")
+            static_msg = "keep static_proj frozen" if freeze_static_proj_in_stage2 else "train static_proj"
+            print(f"Stage-2 enabled: train dynamic backbone + time head, {static_msg}.")
 
         model.train()
         print("="*25)

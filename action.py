@@ -300,15 +300,21 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--root_path", type=str, default="../FS1000 Dataset/")
     parser.add_argument("--gpu", type=int, default=0)
-    parser.add_argument("--cache_dir_name", type=str, default="static_resnet50_cache")
-    parser.add_argument("--cache_prefix", type=str, default="static_resnet50")
+    parser.add_argument("--cache_dir_name", type=str, default="static_resnet50_keyframe_cache")
+    parser.add_argument("--cache_prefix", type=str, default="static_resnet50_keyframe")
     parser.add_argument("--split", type=str, default="all", choices=["train", "val", "all"])
     parser.add_argument("--infer_batch_size", type=int, default=64)
     parser.add_argument("--disable_amp", action="store_true")
     parser.add_argument("--failed_log_name", type=str, default="static_resnet50_failed_videos.txt")
-    parser.add_argument("--keyframe_root", type=str, default=None, help="Directory containing selected_frame_indices.csv outputs.")
+    parser.add_argument(
+        "--keyframe_root",
+        type=str,
+        default="keyframe_selector/outputs/fs1000_all_frame_indices",
+        help="Directory containing per-video selected_frame_indices.csv outputs.",
+    )
     parser.add_argument("--keyframe_csv_name", type=str, default="selected_frame_indices.csv")
-    parser.add_argument("--require_keyframes", action="store_true")
+    parser.add_argument("--require_keyframes", action="store_true", help="Deprecated compatibility flag; keyframes are required by default.")
+    parser.add_argument("--allow_missing_keyframes", action="store_true", help="Allow fallback to original random/center frame sampling.")
     parser.add_argument("--only_data_index", type=str, default=None)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--proxy", type=str, default=None, help="Optional HTTP/HTTPS proxy, e.g. http://127.0.0.1:6518")
@@ -330,6 +336,8 @@ if __name__ == "__main__":
     cache_dir = os.path.join(args.root_path, args.cache_dir_name)
     failed_log_path = os.path.join(args.root_path, args.failed_log_name)
 
+    require_keyframes = args.require_keyframes or not args.allow_missing_keyframes
+
     if args.split in ("train", "all"):
         precompute_split(
             args.root_path,
@@ -340,7 +348,7 @@ if __name__ == "__main__":
             failed_log_path,
             keyframe_root=args.keyframe_root,
             keyframe_csv_name=args.keyframe_csv_name,
-            require_keyframes=args.require_keyframes,
+            require_keyframes=require_keyframes,
             only_data_index=args.only_data_index,
             limit=args.limit,
         )
@@ -354,7 +362,7 @@ if __name__ == "__main__":
             failed_log_path,
             keyframe_root=args.keyframe_root,
             keyframe_csv_name=args.keyframe_csv_name,
-            require_keyframes=args.require_keyframes,
+            require_keyframes=require_keyframes,
             only_data_index=args.only_data_index,
             limit=args.limit,
         )

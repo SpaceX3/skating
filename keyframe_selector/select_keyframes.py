@@ -1095,6 +1095,99 @@ def make_contact_sheet(image_paths: Sequence[Path], out_path: Path, columns: int
     cv2.imwrite(str(out_path), canvas)
 
 
+def split_ids(path: str) -> List[str]:
+    ids: List[str] = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            parts = line.strip().split()
+            if parts:
+                ids.append(parts[0])
+    return ids
+
+
+def batch_video_jobs(args: argparse.Namespace) -> List[Tuple[str, Path, str]]:
+    video_root = Path(args.video_root)
+    videos = {path.stem: path for path in sorted(video_root.glob(args.video_glob))}
+    if args.split_file:
+        ids = split_ids(args.split_file)
+    else:
+        ids = sorted(videos.keys())
+
+    if args.only_data_index:
+        ids = [data_id for data_id in ids if data_id == args.only_data_index]
+    if args.limit is not None:
+        ids = ids[: args.limit]
+
+    jobs: List[Tuple[str, Path, str]] = []
+    missing_videos: List[str] = []
+    for data_id in ids:
+        video_path = videos.get(data_id)
+        if video_path is None:
+            missing_videos.append(data_id)
+            continue
+        feature_path = ""
+        if args.feature_root:
+            candidate = Path(args.feature_root) / f"{data_id}.npy"
+            if candidate.exists():
+                feature_path = str(candidate)
+        jobs.append((str(video_path), Path(args.output_dir) / data_id, feature_path))
+
+    if missing_videos:
+        print(f"[batch][warn] missing videos: {len(missing_videos)}")
+        for data_id in missing_videos[:10]:
+            print(f"[batch][warn] missing video for {data_id}")
+        if len(missing_videos) > 10:
+            print(f"[batch][warn] ... {len(missing_videos) - 10} more")
+    return jobs
+
+
+def run_batch(args: argparse.Namespace) -> int:
+    jobs = batch_video_jobs(args)
+    print(f"[batch] jobs={len(jobs)}, output_root={args.output_dir}")
+    if not jobs:
+        return 1
+
+    failures: List[Tuple[str, str]] = []
+    for job_idx, (video_path, output_dir, feature_path) in enumerate(jobs, start=1):
+        data_id = Path(video_path).stem
+        done_file = output_dir / "selected_frame_indices.csv"
+        if args.skip_existing and done_file.exists():
+            print(f"[batch] {job_idx}/{len(jobs)} skip existing: {data_id}")
+            continue
+        if args.require_feature and not feature_path and args.num_segments is None:
+            msg = "missing feature file and --num-segments was not provided"
+            print(f"[batch][error] {data_id}: {msg}")
+            failures.append((data_id, msg))
+            if not args.continue_on_error:
+                break
+            continue
+
+        print(f"[batch] {job_idx}/{len(jobs)} start: {data_id}")
+        single_args = argparse.Namespace(**vars(args))
+        single_args.video = video_path
+        single_args.output_dir = str(output_dir)
+        single_args.feature_path = feature_path
+        try:
+            select_keyframes(single_args)
+        except Exception as exc:
+            msg = repr(exc)
+            print(f"[batch][error] {data_id}: {msg}")
+            failures.append((data_id, msg))
+            if not args.continue_on_error:
+                break
+
+    if failures:
+        failed_path = Path(args.output_dir) / "failed_videos.txt"
+        failed_path.parent.mkdir(parents=True, exist_ok=True)
+        with failed_path.open("w", encoding="utf-8") as f:
+            for data_id, msg in failures:
+                f.write(f"{data_id}\t{msg}\n")
+        print(f"[batch] failures={len(failures)}, log={failed_path}")
+        return 1
+    print("[batch] done")
+    return 0
+
+
 def select_keyframes(args: argparse.Namespace) -> None:
     video_path = str(Path(args.video))
     output_dir = Path(args.output_dir)
@@ -1302,7 +1395,20 @@ def select_keyframes(args: argparse.Namespace) -> None:
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Select one keyframe per video segment.")
-    parser.add_argument("--video", required=True, help="Path to an input video.")
+    parser.add_argument("--video", default=None, help="Path to one input video.")
+    parser.add_argument("--video-root", default=None, help="Directory of videos for full batch mode.")
+    parser.add_argument("--video-glob", default="*.mp4", help="Video glob under --video-root.")
+    parser.add_argument("--feature-root", default="", help="Directory of dynamic .npy features for batch mode.")
+    parser.add_argument("--split-file", default="", help="Optional split file; first column is used as video id order.")
+    parser.add_argument("--only-data-index", default=None, help="Optional single video id filter for batch mode.")
+    parser.add_argument("--limit", type=int, default=None, help="Optional maximum number of batch videos.")
+    parser.add_argument("--skip-existing", action="store_true", help="Skip videos with selected_frame_indices.csv already written.")
+    parser.add_argument("--continue-on-error", action="store_true", help="Continue batch mode after a video fails.")
+    parser.add_argument(
+        "--require-feature",
+        action="store_true",
+        help="In batch mode, fail a video when its dynamic feature file is missing and --num-segments is not set.",
+    )
     parser.add_argument("--output-dir", required=True, help="Directory for selected frames and CSV files.")
     parser.add_argument("--clip-len", type=float, default=5.0, help="Segment length in seconds.")
     parser.add_argument(
@@ -1399,6 +1505,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
+    if bool(args.video) == bool(args.video_root):
+        raise ValueError("provide exactly one of --video or --video-root")
     if not 0.0 <= args.blur_quantile <= 1.0:
         raise ValueError("--blur-quantile must be in [0, 1]")
     if not 0.0 <= args.jump_threshold_quantile <= 1.0:
@@ -1407,6 +1515,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         raise ValueError("--num-segments must be positive")
     if args.segment_stride is not None and args.segment_stride <= 0:
         raise ValueError("--segment-stride must be positive")
+    if args.limit is not None and args.limit <= 0:
+        raise ValueError("--limit must be positive")
+    if args.video_root:
+        return run_batch(args)
     select_keyframes(args)
     return 0
 

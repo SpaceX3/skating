@@ -25,17 +25,21 @@ The selector uses:
   available. If the pose model cannot be loaded, the script falls back to
   sharpness + frame difference + optical flow.
 
-Example:
+Full-run example:
 
-```powershell
-conda run -n skating-mixer python keyframe_selector/select_keyframes.py `
-  --video "D:\University\3fal\skate\FS1000 Dataset\fs1000\2019_Final_MS_Kevin.mp4" `
-  --output-dir "D:\University\3fal\skate\skating-best\keyframe_selector\outputs\2019_Final_MS_Kevin" `
-  --feature-path "D:\University\3fal\skate\FS1000 Dataset\Timesformer_output_feature_fs800\2019_Final_MS_Kevin.npy" `
-  --clip-len 5 `
-  --sample-fps 4 `
-  --pose-backend auto `
-  --proxy http://127.0.0.1:6518
+```bash
+python -u keyframe_selector/select_keyframes.py \
+  --video-root "../FS1000 Dataset/fs1000" \
+  --feature-root "../FS1000 Dataset/Timesformer_output_feature_fs800" \
+  --output-dir "keyframe_selector/outputs/fs1000_all_frame_indices" \
+  --clip-len 5 \
+  --sample-fps 3 \
+  --event-fps 2 \
+  --pose-backend auto \
+  --frames-only \
+  --skip-existing \
+  --continue-on-error \
+  --require-feature
 ```
 
 Outputs:
