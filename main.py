@@ -14,7 +14,6 @@ from datetime import datetime
 # import time
 # import warnings
 
-dev = 1
 
 def set_trainable_params_for_stage(model, stage: int, freeze_static_proj_in_stage2: bool = True):
     """

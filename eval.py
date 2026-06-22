@@ -109,7 +109,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--checkpoint",
-        default="/home/v100/ZYQ/skating/fs800_result/checkpoint_womean_resnet_0.88.pth",
+        default="/home/v100/ZYQ/skating/fs800_result/checkpoint_epoch102_loss61.58_spear0.859.pth",
     )
     parser.add_argument("--root-path", default="../FS1000 Dataset/")
     parser.add_argument("--batch-size", type=int, default=16)
