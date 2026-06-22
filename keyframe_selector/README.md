@@ -36,6 +36,7 @@ python -u keyframe_selector/select_keyframes.py \
   --sample-fps 3 \
   --event-fps 2 \
   --pose-backend auto \
+  --pose-batch-size 8 \
   --frames-only \
   --skip-existing \
   --continue-on-error \
@@ -63,3 +64,8 @@ to preserve the original 5-second overlapping window count. Without these
 arguments, the script falls back to non-overlapping 5-second windows, which is
 useful for quick visual checks but produces fewer frame rows than the training
 feature sequence.
+Generic candidate metrics are cached by default across overlapping windows, so
+the full run can keep the same `--sample-fps` and `--event-fps` while avoiding
+repeated frame decoding, Laplacian, frame-difference, and optical-flow work.
+Use `--disable-candidate-cache` only for debugging against the old per-window
+implementation.

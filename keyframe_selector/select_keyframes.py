@@ -627,6 +627,303 @@ def events_for_segment(events: Sequence[JumpEvent], segment_start: float, segmen
     ]
 
 
+def score_segment_from_metrics(
+    frame_indices: np.ndarray,
+    fps: float,
+    segment_idx: int,
+    segment_start: float,
+    segment_end: float,
+    blur_quantile: float,
+    sharp_raw: np.ndarray,
+    diff_energy: np.ndarray,
+    flow_energy: np.ndarray,
+    pose_conf: Optional[np.ndarray] = None,
+    pose_energy: Optional[np.ndarray] = None,
+    lower_visible: Optional[np.ndarray] = None,
+) -> Tuple[SegmentResult, List[Dict[str, float]]]:
+    n = len(frame_indices)
+    if n == 0:
+        raise RuntimeError(f"segment {segment_idx} has no readable frames")
+
+    sharp_norm = robust_norm(np.log1p(sharp_raw))
+    blur_threshold = float(np.quantile(sharp_raw, blur_quantile))
+    eligible = sharp_raw >= blur_threshold
+    if not np.any(eligible):
+        eligible[np.argmax(sharp_raw)] = True
+
+    diff_change = local_change_peak(diff_energy)
+    flow_change = local_change_peak(flow_energy)
+
+    diff_energy_norm = robust_norm(diff_energy)
+    flow_energy_norm = robust_norm(flow_energy)
+    diff_change_norm = robust_norm(diff_change)
+    flow_change_norm = robust_norm(flow_change)
+    motion_energy_norm = robust_norm(0.45 * diff_energy + 0.55 * flow_energy)
+
+    if pose_conf is None:
+        pose_conf = np.zeros(n, dtype=np.float32)
+    if pose_energy is None:
+        pose_energy = np.zeros(n, dtype=np.float32)
+    if lower_visible is None:
+        lower_visible = np.zeros(n, dtype=np.float32)
+
+    pose_used = bool(np.any(pose_conf > 0.05))
+    pose_change = local_change_peak(pose_energy)
+    pose_energy_norm = robust_norm(pose_energy) if pose_used else np.zeros(n, dtype=np.float32)
+    pose_change_norm = robust_norm(pose_change) if pose_used else np.zeros(n, dtype=np.float32)
+    pose_conf_norm = robust_norm(pose_conf) if pose_used else np.zeros(n, dtype=np.float32)
+
+    if pose_used:
+        quality = 0.65 * sharp_norm + 0.35 * pose_conf_norm
+        motion_change = 0.42 * flow_change_norm + 0.28 * diff_change_norm + 0.30 * pose_change_norm
+        motion_energy = (
+            0.42 * flow_energy_norm + 0.28 * diff_energy_norm + 0.30 * pose_energy_norm
+        )
+        blur_motion_penalty = motion_energy * (1.0 - sharp_norm) * (1.0 - pose_conf_norm)
+    else:
+        quality = sharp_norm
+        motion_change = 0.60 * flow_change_norm + 0.40 * diff_change_norm
+        motion_energy = 0.60 * flow_energy_norm + 0.40 * diff_energy_norm
+        blur_motion_penalty = motion_energy * (1.0 - sharp_norm)
+
+    glide_penalty = 1.0 - motion_energy
+    final_score = (
+        0.52 * motion_change
+        + 0.20 * motion_energy
+        + 0.28 * quality
+        - 0.22 * glide_penalty
+        - 0.35 * blur_motion_penalty
+    )
+    frame_times = frame_indices.astype(np.float32) / float(fps)
+    rel_pos = (frame_times - float(segment_start)) / max(float(segment_end - segment_start), 1e-6)
+    interior_bias = np.clip(1.0 - np.abs(rel_pos - 0.5) / 0.5, 0.0, 1.0)
+    final_score = final_score + 0.03 * interior_bias
+    final_score = final_score.astype(np.float32)
+    final_score[~eligible] = -np.inf
+
+    best_local_idx = int(np.argmax(final_score))
+    if not np.isfinite(final_score[best_local_idx]):
+        best_local_idx = int(np.argmax(sharp_raw))
+
+    rows: List[Dict[str, float]] = []
+    for i in range(n):
+        rows.append(
+            {
+                "segment_idx": segment_idx,
+                "segment_start": segment_start,
+                "segment_end": segment_end,
+                "candidate_local_idx": i,
+                "frame_index": int(frame_indices[i]),
+                "time_sec": float(frame_indices[i] / fps),
+                "selected": int(i == best_local_idx),
+                "eligible_after_blur_filter": int(eligible[i]),
+                "final_score": float(final_score[i]) if np.isfinite(final_score[i]) else float("-inf"),
+                "sharpness_laplacian_var": float(sharp_raw[i]),
+                "blur_threshold": blur_threshold,
+                "sharpness_norm": float(sharp_norm[i]),
+                "frame_diff_energy_norm": float(diff_energy_norm[i]),
+                "flow_energy_norm": float(flow_energy_norm[i]),
+                "motion_energy_norm": float(motion_energy_norm[i]),
+                "frame_diff_change_norm": float(diff_change_norm[i]),
+                "flow_change_norm": float(flow_change_norm[i]),
+                "pose_conf_norm": float(pose_conf_norm[i]),
+                "pose_energy_norm": float(pose_energy_norm[i]),
+                "pose_change_norm": float(pose_change_norm[i]),
+                "quality_score": float(quality[i]),
+                "motion_change_score": float(motion_change[i]),
+                "interior_bias": float(interior_bias[i]),
+                "glide_penalty": float(glide_penalty[i]),
+                "blur_motion_penalty": float(blur_motion_penalty[i]),
+                "lower_body_visible": float(lower_visible[i]),
+                "selection_mode": "generic",
+                "jump_event_id": "",
+                "jump_phase": "",
+                "event_takeoff_time": "",
+                "event_landing_time": "",
+            }
+        )
+
+    best_row = rows[best_local_idx]
+    result = SegmentResult(
+        segment_idx=segment_idx,
+        segment_start=segment_start,
+        segment_end=segment_end,
+        best_local_idx=best_local_idx,
+        best_frame_index=int(best_row["frame_index"]),
+        best_time_sec=float(best_row["time_sec"]),
+        best_score=float(best_row["final_score"]),
+    )
+    return result, rows
+
+
+class CandidateMetricCache:
+    def __init__(
+        self,
+        video_path: str,
+        frame_indices: Sequence[int],
+        pose_estimator: Optional[PoseEstimator],
+        use_pose: bool,
+        keep_frames: bool,
+    ):
+        self.video_path = video_path
+        self.keep_frames = keep_frames
+        self.use_pose = bool(use_pose and pose_estimator is not None and pose_estimator.enabled)
+        self.frames_bgr: Dict[int, np.ndarray] = {}
+        self.grays: Dict[int, np.ndarray] = {}
+        self.sharpness: Dict[int, float] = {}
+        self.pose_conf: Dict[int, float] = {}
+        self.keypoints: Dict[int, np.ndarray] = {}
+        self.visible: Dict[int, np.ndarray] = {}
+        self.diff_pair: Dict[Tuple[int, int], float] = {}
+        self.flow_pair: Dict[Tuple[int, int], float] = {}
+
+        unique_indices = sorted({int(idx) for idx in frame_indices})
+        self.requested_count = len(frame_indices)
+        self.unique_count = len(unique_indices)
+        self._build(unique_indices, pose_estimator)
+
+    def _build(self, frame_indices: Sequence[int], pose_estimator: Optional[PoseEstimator]) -> None:
+        cap = cv2.VideoCapture(self.video_path)
+        if not cap.isOpened():
+            raise RuntimeError(f"failed to open video: {self.video_path}")
+
+        pose_frames: List[np.ndarray] = []
+        pose_indices: List[int] = []
+        for frame_idx in frame_indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_idx))
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                print(f"[warn] failed to read cached frame {frame_idx}")
+                continue
+            gray_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            lap = cv2.Laplacian(gray_full, cv2.CV_64F)
+            self.sharpness[int(frame_idx)] = float(lap.var())
+
+            h, w = gray_full.shape[:2]
+            if w > 360:
+                scale = 360 / float(w)
+                gray = cv2.resize(
+                    gray_full,
+                    (360, max(1, int(round(h * scale)))),
+                    interpolation=cv2.INTER_AREA,
+                )
+            else:
+                gray = gray_full
+            self.grays[int(frame_idx)] = gray
+
+            if self.keep_frames or self.use_pose:
+                self.frames_bgr[int(frame_idx)] = frame
+            if self.use_pose:
+                pose_frames.append(frame)
+                pose_indices.append(int(frame_idx))
+        cap.release()
+
+        if self.use_pose and pose_frames and pose_estimator is not None:
+            pose_conf, keypoints, visible = pose_estimator.estimate(pose_frames)
+            for i, frame_idx in enumerate(pose_indices):
+                self.pose_conf[frame_idx] = float(pose_conf[i])
+                self.keypoints[frame_idx] = keypoints[i]
+                self.visible[frame_idx] = visible[i]
+            if not self.keep_frames:
+                self.frames_bgr.clear()
+
+    @property
+    def readable_count(self) -> int:
+        return len(self.sharpness)
+
+    def available_indices(self, frame_indices: Sequence[int]) -> np.ndarray:
+        return np.asarray([int(idx) for idx in frame_indices if int(idx) in self.sharpness], dtype=np.int64)
+
+    def frame(self, frame_idx: int) -> Optional[np.ndarray]:
+        return self.frames_bgr.get(int(frame_idx))
+
+    def _diff_between(self, prev_idx: int, curr_idx: int) -> float:
+        key = (int(prev_idx), int(curr_idx))
+        if key not in self.diff_pair:
+            diff = cv2.absdiff(self.grays[key[0]], self.grays[key[1]])
+            self.diff_pair[key] = float(np.mean(diff)) / 255.0
+        return self.diff_pair[key]
+
+    def _flow_between(self, prev_idx: int, curr_idx: int) -> float:
+        key = (int(prev_idx), int(curr_idx))
+        if key not in self.flow_pair:
+            flow = cv2.calcOpticalFlowFarneback(
+                self.grays[key[0]],
+                self.grays[key[1]],
+                None,
+                pyr_scale=0.5,
+                levels=3,
+                winsize=15,
+                iterations=3,
+                poly_n=5,
+                poly_sigma=1.2,
+                flags=0,
+            )
+            u = flow[..., 0]
+            v = flow[..., 1]
+            u = u - np.median(u)
+            v = v - np.median(v)
+            mag = np.sqrt(u * u + v * v)
+            self.flow_pair[key] = float(np.mean(mag))
+        return self.flow_pair[key]
+
+    def score_segment(
+        self,
+        frame_indices: np.ndarray,
+        fps: float,
+        segment_idx: int,
+        segment_start: float,
+        segment_end: float,
+        blur_quantile: float,
+    ) -> Tuple[SegmentResult, List[Dict[str, float]]]:
+        frame_indices = self.available_indices(frame_indices)
+        n = len(frame_indices)
+        if n == 0:
+            raise RuntimeError(f"segment {segment_idx} has no readable frames")
+
+        sharp_raw = np.asarray([self.sharpness[int(idx)] for idx in frame_indices], dtype=np.float32)
+        diff_pair = np.zeros(max(n - 1, 0), dtype=np.float32)
+        flow_pair = np.zeros(max(n - 1, 0), dtype=np.float32)
+        for i in range(1, n):
+            prev_idx = int(frame_indices[i - 1])
+            curr_idx = int(frame_indices[i])
+            diff_pair[i - 1] = self._diff_between(prev_idx, curr_idx)
+            flow_pair[i - 1] = self._flow_between(prev_idx, curr_idx)
+        diff_energy = center_pair_to_candidates(diff_pair, n)
+        flow_energy = center_pair_to_candidates(flow_pair, n)
+
+        pose_conf = None
+        pose_energy = None
+        lower_visible = None
+        if self.use_pose:
+            pose_conf = np.asarray([self.pose_conf.get(int(idx), 0.0) for idx in frame_indices], dtype=np.float32)
+            keypoints = np.asarray(
+                [self.keypoints.get(int(idx), np.full((17, 2), np.nan, dtype=np.float32)) for idx in frame_indices],
+                dtype=np.float32,
+            )
+            visible = np.asarray(
+                [self.visible.get(int(idx), np.zeros(17, dtype=bool)) for idx in frame_indices],
+                dtype=bool,
+            )
+            pose_energy = center_pair_to_candidates(pose_pair_energy(keypoints, visible, pose_conf), n)
+            lower_visible = lower_body_visibility(visible, pose_conf)
+
+        return score_segment_from_metrics(
+            frame_indices=frame_indices,
+            fps=fps,
+            segment_idx=segment_idx,
+            segment_start=segment_start,
+            segment_end=segment_end,
+            blur_quantile=blur_quantile,
+            sharp_raw=sharp_raw,
+            diff_energy=diff_energy,
+            flow_energy=flow_energy,
+            pose_conf=pose_conf,
+            pose_energy=pose_energy,
+            lower_visible=lower_visible,
+        )
+
+
 def score_jump_window(
     frames_bgr: Sequence[np.ndarray],
     frame_indices: np.ndarray,
@@ -824,120 +1121,32 @@ def score_segment(
         raise RuntimeError(f"segment {segment_idx} has no readable frames")
 
     sharp_raw = sharpness_scores(frames_bgr)
-    sharp_norm = robust_norm(np.log1p(sharp_raw))
-    blur_threshold = float(np.quantile(sharp_raw, blur_quantile))
-    eligible = sharp_raw >= blur_threshold
-    if not np.any(eligible):
-        eligible[np.argmax(sharp_raw)] = True
-
     grays = make_gray_frames(frames_bgr)
     diff_energy = center_pair_to_candidates(frame_diff_pair_energy(grays), n)
     flow_energy = center_pair_to_candidates(flow_pair_energy(grays), n)
 
-    diff_change = local_change_peak(diff_energy)
-    flow_change = local_change_peak(flow_energy)
-
-    diff_energy_norm = robust_norm(diff_energy)
-    flow_energy_norm = robust_norm(flow_energy)
-    diff_change_norm = robust_norm(diff_change)
-    flow_change_norm = robust_norm(flow_change)
-    motion_energy_norm = robust_norm(0.45 * diff_energy + 0.55 * flow_energy)
-
-    pose_conf = np.zeros(n, dtype=np.float32)
-    pose_change_norm = np.zeros(n, dtype=np.float32)
-    pose_energy_norm = np.zeros(n, dtype=np.float32)
-    pose_used = False
+    pose_conf = None
+    pose_energy = None
+    lower_visible = None
     if pose_estimator is not None and pose_estimator.enabled:
         pose_conf, keypoints, visible = pose_estimator.estimate(frames_bgr)
         pose_energy = center_pair_to_candidates(pose_pair_energy(keypoints, visible, pose_conf), n)
-        pose_change = local_change_peak(pose_energy)
-        pose_energy_norm = robust_norm(pose_energy)
-        pose_change_norm = robust_norm(pose_change)
-        pose_used = bool(np.any(pose_conf > 0.05))
+        lower_visible = lower_body_visibility(visible, pose_conf)
 
-    pose_conf_norm = robust_norm(pose_conf) if pose_used else np.zeros(n, dtype=np.float32)
-
-    if pose_used:
-        quality = 0.65 * sharp_norm + 0.35 * pose_conf_norm
-        motion_change = 0.42 * flow_change_norm + 0.28 * diff_change_norm + 0.30 * pose_change_norm
-        motion_energy = (
-            0.42 * flow_energy_norm + 0.28 * diff_energy_norm + 0.30 * pose_energy_norm
-        )
-        blur_motion_penalty = motion_energy * (1.0 - sharp_norm) * (1.0 - pose_conf_norm)
-    else:
-        quality = sharp_norm
-        motion_change = 0.60 * flow_change_norm + 0.40 * diff_change_norm
-        motion_energy = 0.60 * flow_energy_norm + 0.40 * diff_energy_norm
-        blur_motion_penalty = motion_energy * (1.0 - sharp_norm)
-
-    glide_penalty = 1.0 - motion_energy
-    final_score = (
-        0.52 * motion_change
-        + 0.20 * motion_energy
-        + 0.28 * quality
-        - 0.22 * glide_penalty
-        - 0.35 * blur_motion_penalty
-    )
-    frame_times = frame_indices.astype(np.float32) / float(fps)
-    rel_pos = (frame_times - float(segment_start)) / max(float(segment_end - segment_start), 1e-6)
-    interior_bias = np.clip(1.0 - np.abs(rel_pos - 0.5) / 0.5, 0.0, 1.0)
-    final_score = final_score + 0.03 * interior_bias
-    final_score = final_score.astype(np.float32)
-    final_score[~eligible] = -np.inf
-
-    best_local_idx = int(np.argmax(final_score))
-    if not np.isfinite(final_score[best_local_idx]):
-        best_local_idx = int(np.argmax(sharp_raw))
-
-    rows: List[Dict[str, float]] = []
-    for i in range(n):
-        rows.append(
-            {
-                "segment_idx": segment_idx,
-                "segment_start": segment_start,
-                "segment_end": segment_end,
-                "candidate_local_idx": i,
-                "frame_index": int(frame_indices[i]),
-                "time_sec": float(frame_indices[i] / fps),
-                "selected": int(i == best_local_idx),
-                "eligible_after_blur_filter": int(eligible[i]),
-                "final_score": float(final_score[i]) if np.isfinite(final_score[i]) else float("-inf"),
-                "sharpness_laplacian_var": float(sharp_raw[i]),
-                "blur_threshold": blur_threshold,
-                "sharpness_norm": float(sharp_norm[i]),
-                "frame_diff_energy_norm": float(diff_energy_norm[i]),
-                "flow_energy_norm": float(flow_energy_norm[i]),
-                "motion_energy_norm": float(motion_energy_norm[i]),
-                "frame_diff_change_norm": float(diff_change_norm[i]),
-                "flow_change_norm": float(flow_change_norm[i]),
-                "pose_conf_norm": float(pose_conf_norm[i]),
-                "pose_energy_norm": float(pose_energy_norm[i]),
-                "pose_change_norm": float(pose_change_norm[i]),
-                "quality_score": float(quality[i]),
-                "motion_change_score": float(motion_change[i]),
-                "interior_bias": float(interior_bias[i]),
-                "glide_penalty": float(glide_penalty[i]),
-                "blur_motion_penalty": float(blur_motion_penalty[i]),
-                "lower_body_visible": 0.0,
-                "selection_mode": "generic",
-                "jump_event_id": "",
-                "jump_phase": "",
-                "event_takeoff_time": "",
-                "event_landing_time": "",
-            }
-        )
-
-    best_row = rows[best_local_idx]
-    result = SegmentResult(
+    return score_segment_from_metrics(
+        frame_indices=frame_indices,
+        fps=fps,
         segment_idx=segment_idx,
         segment_start=segment_start,
         segment_end=segment_end,
-        best_local_idx=best_local_idx,
-        best_frame_index=int(best_row["frame_index"]),
-        best_time_sec=float(best_row["time_sec"]),
-        best_score=float(best_row["final_score"]),
+        blur_quantile=blur_quantile,
+        sharp_raw=sharp_raw,
+        diff_energy=diff_energy,
+        flow_energy=flow_energy,
+        pose_conf=pose_conf,
+        pose_energy=pose_energy,
+        lower_visible=lower_visible,
     )
-    return result, rows
 
 
 def annotate_frame(frame_bgr: np.ndarray, row: Dict[str, float]) -> np.ndarray:
@@ -1141,6 +1350,21 @@ def batch_video_jobs(args: argparse.Namespace) -> List[Tuple[str, Path, str]]:
     return jobs
 
 
+def collect_segment_candidates(
+    fps: float,
+    total_frames: int,
+    windows: Sequence[Tuple[int, float, float]],
+    sample_fps: float,
+) -> Tuple[Dict[int, np.ndarray], List[int]]:
+    per_segment: Dict[int, np.ndarray] = {}
+    all_indices: List[int] = []
+    for segment_idx, seg_start, seg_end in windows:
+        indices = candidate_indices(fps, total_frames, seg_start, seg_end, sample_fps)
+        per_segment[segment_idx] = indices
+        all_indices.extend(int(idx) for idx in indices)
+    return per_segment, all_indices
+
+
 def run_batch(args: argparse.Namespace) -> int:
     jobs = batch_video_jobs(args)
     print(f"[batch] jobs={len(jobs)}, output_root={args.output_dir}")
@@ -1296,30 +1520,73 @@ def select_keyframes(args: argparse.Namespace) -> None:
     all_rows: List[Dict[str, float]] = []
     selected_rows: List[Dict[str, float]] = []
     annotated_paths: List[Path] = []
+    segment_candidates: Dict[int, np.ndarray] = {}
+    candidate_cache: Optional[CandidateMetricCache] = None
+    if selected_windows and not args.disable_candidate_cache:
+        segment_candidates, all_candidate_indices = collect_segment_candidates(
+            fps=fps,
+            total_frames=total_frames,
+            windows=selected_windows,
+            sample_fps=args.sample_fps,
+        )
+        candidate_cache = CandidateMetricCache(
+            video_path=video_path,
+            frame_indices=all_candidate_indices,
+            pose_estimator=pose if args.generic_use_pose else None,
+            use_pose=args.generic_use_pose,
+            keep_frames=not args.frames_only,
+        )
+        print(
+            "[cache] generic candidates "
+            f"requested={candidate_cache.requested_count}, "
+            f"unique={candidate_cache.unique_count}, "
+            f"readable={candidate_cache.readable_count}, "
+            f"pose={'on' if candidate_cache.use_pose else 'off'}"
+        )
 
     for segment_idx, seg_start, seg_end in selected_windows:
-        indices = candidate_indices(fps, total_frames, seg_start, seg_end, args.sample_fps)
-        frames = read_frames(video_path, indices)
-        if len(frames) != len(indices):
-            valid_count = min(len(frames), len(indices))
-            frames = frames[:valid_count]
-            indices = indices[:valid_count]
-        if not frames:
-            print(f"[warn] segment {segment_idx:03d}: no readable frames")
-            continue
+        if candidate_cache is not None:
+            indices = segment_candidates[segment_idx]
+            try:
+                result, rows = candidate_cache.score_segment(
+                    frame_indices=indices,
+                    fps=fps,
+                    segment_idx=segment_idx,
+                    segment_start=seg_start,
+                    segment_end=seg_end,
+                    blur_quantile=args.blur_quantile,
+                )
+            except RuntimeError:
+                print(f"[warn] segment {segment_idx:03d}: no readable frames")
+                continue
+            best_row = rows[result.best_local_idx]
+            best_frame = candidate_cache.frame(int(best_row["frame_index"]))
+            if best_frame is None and not args.frames_only:
+                best_frames = read_frames(video_path, [int(best_row["frame_index"])])
+                best_frame = best_frames[0] if best_frames else None
+        else:
+            indices = candidate_indices(fps, total_frames, seg_start, seg_end, args.sample_fps)
+            frames = read_frames(video_path, indices)
+            if len(frames) != len(indices):
+                valid_count = min(len(frames), len(indices))
+                frames = frames[:valid_count]
+                indices = indices[:valid_count]
+            if not frames:
+                print(f"[warn] segment {segment_idx:03d}: no readable frames")
+                continue
 
-        result, rows = score_segment(
-            frames_bgr=frames,
-            frame_indices=indices,
-            fps=fps,
-            segment_idx=segment_idx,
-            segment_start=seg_start,
-            segment_end=seg_end,
-            blur_quantile=args.blur_quantile,
-            pose_estimator=pose if args.generic_use_pose else None,
-        )
-        best_frame = frames[result.best_local_idx]
-        best_row = rows[result.best_local_idx]
+            result, rows = score_segment(
+                frames_bgr=frames,
+                frame_indices=indices,
+                fps=fps,
+                segment_idx=segment_idx,
+                segment_start=seg_start,
+                segment_end=seg_end,
+                blur_quantile=args.blur_quantile,
+                pose_estimator=pose if args.generic_use_pose else None,
+            )
+            best_frame = frames[result.best_local_idx]
+            best_row = rows[result.best_local_idx]
 
         segment_events = events_for_segment(jump_events, seg_start, seg_end)
         jump_selection = None
@@ -1357,7 +1624,7 @@ def select_keyframes(args: argparse.Namespace) -> None:
         )
         clean_path = clean_dir / f"{stem}.jpg"
         annotated_path = annotated_dir / f"{stem}.jpg"
-        if not args.frames_only:
+        if not args.frames_only and best_frame is not None:
             cv2.imwrite(str(clean_path), best_frame)
             cv2.imwrite(str(annotated_path), annotate_frame(best_frame, best_row))
             annotated_paths.append(annotated_path)
@@ -1498,6 +1765,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--start-segment", type=int, default=0)
     parser.add_argument("--max-segments", type=int, default=None)
     parser.add_argument("--frames-only", action="store_true", help="Only write selected frame-number files and CSV logs.")
+    parser.add_argument("--disable-candidate-cache", action="store_true", help="Disable cached generic candidate metrics.")
     parser.add_argument("--no-contact-sheet", action="store_true")
     parser.add_argument("--sheet-columns", type=int, default=5)
     return parser.parse_args(argv)
