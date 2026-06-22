@@ -1,1 +1,9 @@
 fs800_result/
+__pycache__/
+*.pyc
+*.pth
+*.pt
+*.npy
+keyframe_selector/outputs/
+static_resnet50_cache/
+static_resnet50_keyframe_cache*/
