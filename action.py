@@ -2,6 +2,7 @@ import argparse
 import csv
 import os
 import random
+import time
 import numpy as np
 import torch
 from glob import glob
@@ -219,7 +220,7 @@ def _append_failed_video(failed_log_path, data_index, video_path):
         f.write(f"{data_index} {video_path}\n")
 
 
-def precompute_split(
+def _precompute_split_once(
     root_path,
     split_name,
     extractor,
@@ -229,6 +230,7 @@ def precompute_split(
     keyframe_root=None,
     keyframe_csv_name="selected_frame_indices.csv",
     require_keyframes=False,
+    skip_missing_keyframes=False,
     only_data_index=None,
     limit=None,
 ):
@@ -238,6 +240,8 @@ def precompute_split(
     print(f"[action] start split={split_name}, total={total}")
 
     processed = 0
+    waiting_for_keyframes = 0
+    skipped_existing = 0
     for i, row in enumerate(rows):
         data_index = row[0]
         if only_data_index is not None and data_index != only_data_index:
@@ -255,6 +259,7 @@ def precompute_split(
         out_path = _cache_path(cache_dir, cache_prefix, data_index, T_dyn)
         # Skip if exact cache exists or this video has been precomputed before.
         if os.path.exists(out_path) or _already_precomputed_any(cache_dir, cache_prefix, data_index):
+            skipped_existing += 1
             continue
 
         keyframe_rows = None
@@ -269,6 +274,9 @@ def precompute_split(
                     "or --feature-path to produce one keyframe per overlapping dynamic window."
                 )
         elif require_keyframes:
+            if skip_missing_keyframes:
+                waiting_for_keyframes += 1
+                continue
             raise FileNotFoundError(f"Missing keyframe file for {data_index} under {keyframe_root}")
         elif keyframe_root:
             print(f"[action][warn] {data_index}: keyframe file missing; fallback to original frame sampling")
@@ -293,7 +301,120 @@ def precompute_split(
 
         if (i + 1) % 50 == 0 or (i + 1) == total:
             print(f"[action] {split_name}: {i + 1}/{total}")
-    print(f"[action] done split={split_name}, processed={processed}")
+    print(
+        f"[action] done split={split_name}, processed={processed}, "
+        f"existing={skipped_existing}, waiting_keyframes={waiting_for_keyframes}"
+    )
+    return processed, waiting_for_keyframes
+
+
+def precompute_split(
+    root_path,
+    split_name,
+    extractor,
+    cache_dir,
+    cache_prefix,
+    failed_log_path,
+    keyframe_root=None,
+    keyframe_csv_name="selected_frame_indices.csv",
+    require_keyframes=False,
+    only_data_index=None,
+    limit=None,
+):
+    processed, waiting_for_keyframes = _precompute_split_once(
+        root_path=root_path,
+        split_name=split_name,
+        extractor=extractor,
+        cache_dir=cache_dir,
+        cache_prefix=cache_prefix,
+        failed_log_path=failed_log_path,
+        keyframe_root=keyframe_root,
+        keyframe_csv_name=keyframe_csv_name,
+        require_keyframes=require_keyframes,
+        skip_missing_keyframes=False,
+        only_data_index=only_data_index,
+        limit=limit,
+    )
+    if require_keyframes and processed == 0 and waiting_for_keyframes > 0:
+        print(
+            f"[action][warn] split={split_name}: {waiting_for_keyframes} videos are waiting for keyframe files."
+        )
+    return processed
+
+
+def precompute_with_keyframe_watch(
+    root_path,
+    split_names,
+    extractor,
+    cache_dir,
+    cache_prefix,
+    failed_log_path,
+    keyframe_root,
+    keyframe_csv_name,
+    require_keyframes,
+    only_data_index,
+    limit,
+    watch_timeout_sec,
+    watch_interval_sec,
+):
+    last_progress_time = time.time()
+    total_processed = 0
+    round_idx = 0
+    while True:
+        round_idx += 1
+        round_processed = 0
+        waiting_total = 0
+        print(f"[action][watch] scan round={round_idx}")
+        for split_name in split_names:
+            processed, waiting = _precompute_split_once(
+                root_path=root_path,
+                split_name=split_name,
+                extractor=extractor,
+                cache_dir=cache_dir,
+                cache_prefix=cache_prefix,
+                failed_log_path=failed_log_path,
+                keyframe_root=keyframe_root,
+                keyframe_csv_name=keyframe_csv_name,
+                require_keyframes=require_keyframes,
+                skip_missing_keyframes=True,
+                only_data_index=only_data_index,
+                limit=limit,
+            )
+            round_processed += processed
+            waiting_total += waiting
+
+        if round_processed > 0:
+            total_processed += round_processed
+            last_progress_time = time.time()
+            print(
+                f"[action][watch] round={round_idx} processed={round_processed}, "
+                f"total_processed={total_processed}, waiting_keyframes={waiting_total}"
+            )
+            continue
+
+        if waiting_total <= 0:
+            print(
+                f"[action][watch] no pending videos without keyframes; "
+                f"total_processed={total_processed}. Exit."
+            )
+            break
+
+        idle_sec = time.time() - last_progress_time
+        if idle_sec >= watch_timeout_sec:
+            print(
+                f"[action][watch] no new processable keyframe output for {idle_sec:.0f}s "
+                f"(timeout={watch_timeout_sec}s); pending_without_keyframes={waiting_total}. Exit."
+            )
+            break
+
+        sleep_sec = min(watch_interval_sec, max(1, watch_timeout_sec - idle_sec))
+        print(
+            f"[action][watch] waiting for new keyframe outputs: "
+            f"pending={waiting_total}, idle={idle_sec:.0f}s/{watch_timeout_sec}s, sleep={sleep_sec}s"
+        )
+        time.sleep(sleep_sec)
+
+    return total_processed
 
 
 if __name__ == "__main__":
@@ -318,6 +439,16 @@ if __name__ == "__main__":
     parser.add_argument("--only_data_index", type=str, default=None)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--proxy", type=str, default=None, help="Optional HTTP/HTTPS proxy, e.g. http://127.0.0.1:7890")
+    parser.add_argument(
+        "--watch_keyframes",
+        action="store_true",
+        help=(
+            "Process videos whose keyframe files already exist, then keep polling for new "
+            "keyframe outputs until no new video is processed for --watch_timeout_sec."
+        ),
+    )
+    parser.add_argument("--watch_timeout_sec", type=int, default=600)
+    parser.add_argument("--watch_interval_sec", type=int, default=30)
     args = parser.parse_args()
 
     if args.proxy:
@@ -338,33 +469,47 @@ if __name__ == "__main__":
 
     require_keyframes = args.require_keyframes or not args.allow_missing_keyframes
 
+    split_names = []
     if args.split in ("train", "all"):
-        precompute_split(
-            args.root_path,
-            "train",
-            extractor,
-            cache_dir,
-            args.cache_prefix,
-            failed_log_path,
-            keyframe_root=args.keyframe_root,
-            keyframe_csv_name=args.keyframe_csv_name,
-            require_keyframes=require_keyframes,
-            only_data_index=args.only_data_index,
-            limit=args.limit,
-        )
+        split_names.append("train")
     if args.split in ("val", "all"):
-        precompute_split(
-            args.root_path,
-            "val",
-            extractor,
-            cache_dir,
-            args.cache_prefix,
-            failed_log_path,
+        split_names.append("val")
+
+    if args.watch_timeout_sec < 1:
+        raise ValueError("--watch_timeout_sec must be positive")
+    if args.watch_interval_sec < 1:
+        raise ValueError("--watch_interval_sec must be positive")
+
+    if args.watch_keyframes:
+        precompute_with_keyframe_watch(
+            root_path=args.root_path,
+            split_names=split_names,
+            extractor=extractor,
+            cache_dir=cache_dir,
+            cache_prefix=args.cache_prefix,
+            failed_log_path=failed_log_path,
             keyframe_root=args.keyframe_root,
             keyframe_csv_name=args.keyframe_csv_name,
             require_keyframes=require_keyframes,
             only_data_index=args.only_data_index,
             limit=args.limit,
+            watch_timeout_sec=args.watch_timeout_sec,
+            watch_interval_sec=args.watch_interval_sec,
         )
+    else:
+        for split_name in split_names:
+            precompute_split(
+                args.root_path,
+                split_name,
+                extractor,
+                cache_dir,
+                args.cache_prefix,
+                failed_log_path,
+                keyframe_root=args.keyframe_root,
+                keyframe_csv_name=args.keyframe_csv_name,
+                require_keyframes=require_keyframes,
+                only_data_index=args.only_data_index,
+                limit=args.limit,
+            )
 
     print("[action] static feature precompute finished.")

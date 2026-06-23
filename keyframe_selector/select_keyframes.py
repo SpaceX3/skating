@@ -366,6 +366,34 @@ def candidate_indices(
     return np.unique(np.clip(indices, 0, total_frames - 1))
 
 
+def video_metadata(video_path: str) -> Tuple[float, int, float]:
+    cap = cv2.VideoCapture(video_path)
+    if cap.isOpened():
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 25.0)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        cap.release()
+        duration = total_frames / fps if total_frames > 0 and fps > 0 else 0.0
+        if total_frames > 0 and duration > 0:
+            return fps, total_frames, duration
+    else:
+        cap.release()
+
+    try:
+        from decord import VideoReader, cpu
+
+        vr = VideoReader(video_path, ctx=cpu(0))
+        total_frames = len(vr)
+        fps = float(vr.get_avg_fps() or 25.0)
+        duration = total_frames / fps if total_frames > 0 and fps > 0 else 0.0
+        if total_frames > 0 and duration > 0:
+            print(f"[video][warn] OpenCV could not read metadata; using Decord metadata for {video_path}")
+            return fps, total_frames, duration
+    except Exception as exc:
+        raise RuntimeError(f"failed to open video: {video_path}") from exc
+
+    raise RuntimeError(f"invalid video metadata: frames={total_frames}, fps={fps}")
+
+
 def _decode_frames_opencv(video_path: str, frame_indices: Sequence[int]) -> List[Tuple[int, np.ndarray]]:
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -420,7 +448,9 @@ def decode_indexed_frames(
 ) -> Tuple[List[Tuple[int, np.ndarray]], str]:
     backends = [decode_backend]
     if decode_backend == "auto":
-        backends = ["decord-gpu", "decord-cpu", "opencv"]
+        # Long, sparse get_batch calls can hang with Decord GPU/NVDEC on some MP4s.
+        # CPU Decord is fast for sampled keyframe reads; keep GPU for pose/flow.
+        backends = ["decord-cpu", "decord-gpu", "opencv"]
 
     last_error: Optional[Exception] = None
     for backend in backends:
@@ -486,9 +516,49 @@ def frame_diff_pair_energy(grays: Sequence[np.ndarray]) -> np.ndarray:
     return pair
 
 
-def flow_pair_energy(grays: Sequence[np.ndarray]) -> np.ndarray:
+def _flow_energy_from_dense(flow: np.ndarray) -> float:
+    u = flow[..., 0]
+    v = flow[..., 1]
+    u = u - np.median(u)
+    v = v - np.median(v)
+    mag = np.sqrt(u * u + v * v)
+    return float(np.mean(mag))
+
+
+def _create_cuda_farneback_flow():
+    if not hasattr(cv2, "cuda") or cv2.cuda.getCudaEnabledDeviceCount() <= 0:
+        raise RuntimeError("cv2.cuda has no enabled devices")
+    if not hasattr(cv2, "cuda_FarnebackOpticalFlow"):
+        raise RuntimeError("cv2.cuda_FarnebackOpticalFlow is unavailable")
+    return cv2.cuda_FarnebackOpticalFlow.create(3, 0.5, False, 15, 3, 5, 1.2, 0)
+
+
+def flow_pair_energy(grays: Sequence[np.ndarray], backend: str = "auto") -> np.ndarray:
     n = len(grays)
     pair = np.zeros(max(n - 1, 0), dtype=np.float32)
+    if len(pair) == 0:
+        return pair
+
+    if backend not in ("auto", "cuda", "cpu"):
+        backend = "cpu"
+
+    if backend in ("auto", "cuda"):
+        try:
+            cuda_flow = _create_cuda_farneback_flow()
+            prev_gpu = cv2.cuda_GpuMat()
+            prev_gpu.upload(grays[0])
+            for i in range(1, n):
+                curr_gpu = cv2.cuda_GpuMat()
+                curr_gpu.upload(grays[i])
+                flow = cuda_flow.calc(prev_gpu, curr_gpu, None).download()
+                pair[i - 1] = _flow_energy_from_dense(flow)
+                prev_gpu = curr_gpu
+            print(f"[jump][flow] backend=cuda, pairs={len(pair)}")
+            return pair
+        except Exception as exc:
+            if backend == "cuda":
+                print(f"[jump][flow][warn] CUDA flow unavailable: {exc}; falling back to CPU")
+
     for i in range(1, n):
         flow = cv2.calcOpticalFlowFarneback(
             grays[i - 1],
@@ -502,14 +572,9 @@ def flow_pair_energy(grays: Sequence[np.ndarray]) -> np.ndarray:
             poly_sigma=1.2,
             flags=0,
         )
-        u = flow[..., 0]
-        v = flow[..., 1]
-        u = u - np.median(u)
-        v = v - np.median(v)
-        mag = np.sqrt(u * u + v * v)
-        pair[i - 1] = float(np.mean(mag))
+        pair[i - 1] = _flow_energy_from_dense(flow)
+    print(f"[jump][flow] backend=cpu, pairs={len(pair)}")
     return pair
-
 
 def center_pair_to_candidates(pair: np.ndarray, n: int) -> np.ndarray:
     if n == 0:
@@ -620,6 +685,7 @@ def analyze_video_timeline(
     pose_estimator: Optional[PoseEstimator],
     decode_backend: str = "opencv",
     decode_device: int = 0,
+    flow_backend: str = "auto",
 ) -> TimelineData:
     frame_indices = candidate_indices(
         fps=fps,
@@ -640,7 +706,7 @@ def analyze_video_timeline(
     sharp_norm = robust_norm(np.log1p(sharp_raw))
     grays = make_gray_frames(frames)
     diff_energy = center_pair_to_candidates(frame_diff_pair_energy(grays), len(frames))
-    flow_energy = center_pair_to_candidates(flow_pair_energy(grays), len(frames))
+    flow_energy = center_pair_to_candidates(flow_pair_energy(grays, flow_backend), len(frames))
     diff_change = local_change_peak(diff_energy)
     flow_change = local_change_peak(flow_energy)
 
@@ -1366,6 +1432,7 @@ def score_segment(
     segment_end: float,
     blur_quantile: float,
     pose_estimator: Optional[PoseEstimator],
+    flow_backend: str = "auto",
 ) -> Tuple[SegmentResult, List[Dict[str, float]]]:
     n = len(frames_bgr)
     if n == 0:
@@ -1374,7 +1441,7 @@ def score_segment(
     sharp_raw = sharpness_scores(frames_bgr)
     grays = make_gray_frames(frames_bgr)
     diff_energy = center_pair_to_candidates(frame_diff_pair_energy(grays), n)
-    flow_energy = center_pair_to_candidates(flow_pair_energy(grays), n)
+    flow_energy = center_pair_to_candidates(flow_pair_energy(grays, flow_backend), n)
 
     pose_conf = None
     pose_energy = None
@@ -1674,16 +1741,7 @@ def select_keyframes(args: argparse.Namespace) -> None:
     else:
         output_dir.mkdir(parents=True, exist_ok=True)
 
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise RuntimeError(f"failed to open video: {video_path}")
-    fps = float(cap.get(cv2.CAP_PROP_FPS) or 25.0)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    duration = total_frames / fps if total_frames > 0 else 0.0
-    cap.release()
-
-    if total_frames <= 0 or duration <= 0:
-        raise RuntimeError(f"invalid video metadata: frames={total_frames}, fps={fps}")
+    fps, total_frames, duration = video_metadata(video_path)
 
     pose = PoseEstimator(
         backend=args.pose_backend,
@@ -1692,6 +1750,18 @@ def select_keyframes(args: argparse.Namespace) -> None:
         max_side=args.pose_max_side,
         proxy=args.proxy,
     )
+
+    effective_flow_backend = args.flow_backend
+    if (
+        effective_flow_backend == "auto"
+        and pose.enabled
+        and str(pose.device).startswith("cuda")
+    ):
+        effective_flow_backend = "cpu"
+        print(
+            "[flow][warn] GPU pose is enabled; using CPU optical flow to avoid "
+            "mixing Torch CUDA with cv2.cuda in one process. Use --flow-backend cuda to force cv2.cuda."
+        )
 
     num_segments_arg = args.num_segments
     if args.feature_path:
@@ -1744,6 +1814,7 @@ def select_keyframes(args: argparse.Namespace) -> None:
             pose_estimator=pose,
             decode_backend=args.decode_backend,
             decode_device=args.decode_device,
+            flow_backend=effective_flow_backend,
         )
         jump_events = detect_jump_events(
             timeline=timeline,
@@ -1790,7 +1861,7 @@ def select_keyframes(args: argparse.Namespace) -> None:
             keep_frames=not args.frames_only,
             decode_backend=args.decode_backend,
             decode_device=args.decode_device,
-            flow_backend=args.flow_backend,
+            flow_backend=effective_flow_backend,
         )
         print(
             "[cache] generic candidates "
@@ -1847,6 +1918,7 @@ def select_keyframes(args: argparse.Namespace) -> None:
                 segment_end=seg_end,
                 blur_quantile=args.blur_quantile,
                 pose_estimator=pose if args.generic_use_pose else None,
+                flow_backend=effective_flow_backend,
             )
             best_frame = frames[result.best_local_idx]
             best_row = rows[result.best_local_idx]
@@ -1983,14 +2055,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--decode-backend",
         choices=["auto", "opencv", "decord-cpu", "decord-gpu"],
         default="auto",
-        help="Frame decode backend. auto tries decord-gpu, decord-cpu, then opencv.",
+        help="Frame decode backend. auto tries decord-cpu first to avoid long sparse decord-gpu stalls.",
     )
     parser.add_argument("--decode-device", type=int, default=0, help="GPU id for decord-gpu decoding.")
     parser.add_argument(
         "--flow-backend",
         choices=["auto", "cpu", "cuda"],
         default="auto",
-        help="Optical-flow backend for cached generic candidates. auto tries cv2.cuda Farneback.",
+        help="Optical-flow backend for jump detection and cached generic candidates. auto uses CPU when GPU pose is enabled.",
     )
     parser.add_argument(
         "--proxy",

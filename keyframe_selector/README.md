@@ -28,24 +28,25 @@ The selector uses:
 Full-run example:
 
 ```bash
-python -u keyframe_selector/select_keyframes.py \
-  --video-root "../FS1000 Dataset/fs1000" \
-  --feature-root "../FS1000 Dataset/Timesformer_output_feature_fs800" \
-  --output-dir "keyframe_selector/outputs/fs1000_all_frame_indices" \
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=2 nohup python -u keyframe_selector/select_keyframes.py \
+  --video-root '../FS1000 Dataset/fs1000' \
+  --video-glob '*.mp4' \
+  --feature-root '../FS1000 Dataset/Timesformer_output_feature_fs800' \
+  --output-dir 'keyframe_selector/outputs/fs1000_all_frame_indices' \
   --clip-len 5 \
   --sample-fps 3 \
   --event-fps 2 \
   --pose-backend auto \
-  --gpu auto \
+  --device cuda:0 \
   --pose-batch-size 8 \
   --decode-backend auto \
-  --flow-backend auto \
-  --decode-backend auto \
+  --decode-device 0 \
   --flow-backend auto \
   --frames-only \
+  --require-feature \
   --skip-existing \
   --continue-on-error \
-  --require-feature
+  > keyframe_selector/outputs/fs1000_keyframe_run.log 2>&1 &
 ```
 
 Outputs:
