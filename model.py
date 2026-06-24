@@ -29,7 +29,18 @@ class PreNormResidual(nn.Module):
         return self.fn(self.norm(x)) + x
 
 class scoring_head(nn.Module):
-    def __init__(self, depth, input_dim, dim, input_len=2, num_scores=1, use_static_branch=False, static_in_dim=2048, static_proj_dim=128):
+    def __init__(
+        self,
+        depth,
+        input_dim,
+        dim,
+        input_len=2,
+        num_scores=1,
+        use_static_branch=False,
+        static_in_dim=2048,
+        static_proj_dim=128,
+        time_score_dropout=0.2,
+    ):
         super().__init__()
         self.use_static_branch = use_static_branch
 
@@ -60,8 +71,10 @@ class scoring_head(nn.Module):
         self.time_score_mlp = nn.Sequential(
             nn.Linear(fused_dim, hidden1),
             nn.GELU(),
+            nn.Dropout(time_score_dropout),
             nn.Linear(hidden1, hidden2),
             nn.GELU(),
+            nn.Dropout(time_score_dropout),
             nn.Linear(hidden2, num_scores),
         )
 
