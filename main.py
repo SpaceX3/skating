@@ -14,8 +14,6 @@ from datetime import datetime
 # import time
 # import warnings
 
-dev = 0
-
 def set_trainable_params_for_stage(model, stage: int, freeze_static_proj_in_stage2: bool = True):
     """
     stage=1: freeze dynamic backbone, only train static_proj + time_score_mlp
@@ -91,7 +89,7 @@ def close_log_output(log_stream):
     sys.stderr = sys.__stderr__
     log_stream.close()
 
-def validation(dataloader, model, criterion, score_index):
+def validation(dataloader, model, criterion, score_index, gpu):
     model.eval()
     val_loss = 0
     val_truth = []
@@ -100,12 +98,12 @@ def validation(dataloader, model, criterion, score_index):
 
     for audio_feature, video_feature, inv_audio_feature, inv_video_feature, static_feature, audio_len, video_len, score, data_index in dataloader:
         batch_size, _, _, _ = audio_feature.shape
-        audio_feature = audio_feature.cuda(device=dev)
-        video_feature = video_feature.cuda(device=dev)
-        inv_audio_feature = inv_audio_feature.cuda(device=dev)
-        inv_video_feature = inv_video_feature.cuda(device=dev)
-        static_feature = static_feature.cuda(device=dev)
-        target = score[score_index].cuda(device=dev)
+        audio_feature = audio_feature.cuda(device=gpu)
+        video_feature = video_feature.cuda(device=gpu)
+        inv_audio_feature = inv_audio_feature.cuda(device=gpu)
+        inv_video_feature = inv_video_feature.cuda(device=gpu)
+        static_feature = static_feature.cuda(device=gpu)
+        target = score[score_index].cuda(device=gpu)
 
         with torch.no_grad():
             output = model(audio_feature, video_feature, inv_audio_feature, inv_video_feature, audio_len, video_len, static_feature)
@@ -125,7 +123,7 @@ def validation(dataloader, model, criterion, score_index):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument("--gpu", type=int, default=dev)
+    parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--log-dir", default="./fs800_result")
     parser.add_argument("--log-file", default=None)
     parser.add_argument("--root-path", default="../FS1000 Dataset/")
@@ -142,7 +140,7 @@ if __name__ == '__main__':
     parser.add_argument("--only-data-index", default=None)
     parser.add_argument("--smoke-test", action="store_true")
     args = parser.parse_args()
-    dev = args.gpu
+    gpu = args.gpu
     log_stream = setup_log_output(args.log_dir, args.log_file)
 
     # build dataset
@@ -192,7 +190,7 @@ if __name__ == '__main__':
         use_static_branch=True,
         static_in_dim=2048,
         static_proj_dim=128,
-    ).cuda(device=dev)  #, bidirection=True
+    ).cuda(device=gpu)  #, bidirection=True
 
     epochs = args.epochs
     warm_up_epochs = 10
@@ -240,13 +238,13 @@ if __name__ == '__main__':
 
         for audio_feature, video_feature, inv_audio_feature, inv_video_feature, static_feature, audio_len, video_len, score, data_index in train_dataloader:
             batch_size, _, _, _ = audio_feature.shape
-            audio_feature = audio_feature.cuda(device=dev)
-            video_feature = video_feature.cuda(device=dev)
-            inv_audio_feature = inv_audio_feature.cuda(device=dev)
-            inv_video_feature = inv_video_feature.cuda(device=dev)
-            static_feature = static_feature.cuda(device=dev)
+            audio_feature = audio_feature.cuda(device=gpu)
+            video_feature = video_feature.cuda(device=gpu)
+            inv_audio_feature = inv_audio_feature.cuda(device=gpu)
+            inv_video_feature = inv_video_feature.cuda(device=gpu)
+            static_feature = static_feature.cuda(device=gpu)
 
-            target = score[score_index].cuda(device=dev)
+            target = score[score_index].cuda(device=gpu)
 
             train_loss = 0
             optimizer.zero_grad()
@@ -268,7 +266,7 @@ if __name__ == '__main__':
         print("train_loss: ", epoch_train_loss, " | train spear corr: ", train_spear)
         scheduler.step()
         # validation
-        val_loss, spear = validation(val_dataloader, model, criterion, score_index)
+        val_loss, spear = validation(val_dataloader, model, criterion, score_index, gpu)
         print("val_loss: ", val_loss, " | spear corr: ", spear)
         if val_loss < min_val_loss:
             min_val_loss = val_loss
@@ -287,5 +285,4 @@ if __name__ == '__main__':
 
         print(optimizer.param_groups[0]['lr'])
         # scheduler.step()
-
 

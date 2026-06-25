@@ -39,7 +39,7 @@ class scoring_head(nn.Module):
         use_static_branch=False,
         static_in_dim=2048,
         static_proj_dim=128,
-        time_score_dropout=0.2,
+        time_score_dropout=0.0,
     ):
         super().__init__()
         self.use_static_branch = use_static_branch
