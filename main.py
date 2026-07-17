@@ -127,8 +127,8 @@ if __name__ == '__main__':
     parser.add_argument("--log-dir", default="./fs800_result")
     parser.add_argument("--log-file", default=None)
     parser.add_argument("--root-path", default="../FS1000 Dataset/")
-    parser.add_argument("--static-cache-dir-name", default="static_resnet50_keyframe_cache") # static_resnet50_cache
-    parser.add_argument("--static-cache-prefix", default="static_resnet50_keyframe")  # static_resnet50
+    parser.add_argument("--static-cache-dir-name", choices = ["static_resnet50_cache", "static_resnet50_keyframe_cache", "static_dinov2_cls_patch_mean_cache"], default="static_dinov2_cls_patch_mean_cache")
+    parser.add_argument("--static-cache-prefix", choices = ["static_resnet50", "static_resnet50_keyframe", "static_dinov2_cls_patch_mean"], default="static_dinov2_cls_patch_mean")
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--epochs", type=int, default=200)
@@ -189,7 +189,7 @@ if __name__ == '__main__':
         num_scores=1,
         use_static_branch=True,
         static_in_dim=2048,
-        static_proj_dim=128,
+        static_proj_dim=512,  #128
     ).cuda(device=gpu)  #, bidirection=True
 
     epochs = args.epochs

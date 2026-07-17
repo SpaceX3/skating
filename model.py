@@ -63,19 +63,16 @@ class scoring_head(nn.Module):
 
         # time-wise scoring head: 2 hidden layers MLP applied on each timestep feature
         # input: [B, T, dim] -> output: [B, T, num_scores]
-        hidden1 = dim // 2
-        hidden2 = max(dim // 4, 1)
+        hidden1 = max(dim // 2, 128)
         fused_dim = dim + static_proj_dim if self.use_static_branch else dim
         if self.use_static_branch:
             self.static_proj = nn.Linear(static_in_dim, static_proj_dim)
         self.time_score_mlp = nn.Sequential(
+            nn.LayerNorm(fused_dim),
             nn.Linear(fused_dim, hidden1),
             nn.GELU(),
             nn.Dropout(time_score_dropout),
-            nn.Linear(hidden1, hidden2),
-            nn.GELU(),
-            nn.Dropout(time_score_dropout),
-            nn.Linear(hidden2, num_scores),
+            nn.Linear(hidden1, num_scores)
         )
 
         # for c3d & vggish

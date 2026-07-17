@@ -149,7 +149,7 @@ class DinoV2StaticFeatureExtractor:
         self,
         device="cuda:0",
         model_name="dinov2_vitl14",
-        output_dim=2048,
+        output_dim=None,
         image_size=224,
         infer_batch_size=16,
         decode_batch_size=128,
@@ -161,7 +161,9 @@ class DinoV2StaticFeatureExtractor:
     ):
         self.device = device
         self.model_name = model_name
-        self.output_dim = int(output_dim)
+        self.expected_output_dim = (
+            None if output_dim is None else int(output_dim)
+        )
         self.image_size = int(image_size)
         self.infer_batch_size = int(infer_batch_size)
         self.decode_batch_size = int(decode_batch_size)
@@ -170,10 +172,11 @@ class DinoV2StaticFeatureExtractor:
         self.sample_first_sec = float(sample_first_sec)
         self.frames_per_second = int(frames_per_second)
         self.hub_dir = hub_dir
-        self.static_in_dim = self.output_dim
+        self.feature_dim = None
+        self.static_in_dim = None
         self.model = None
         self.preprocess = None
-        self._warned_dim_fit = False
+        self._logged_feature_shapes = False
 
     def lazy_init(self):
         if self.model is not None:
@@ -200,9 +203,26 @@ class DinoV2StaticFeatureExtractor:
                 trust_repo=True,
             )
         self.model.eval().to(self.device)
+        feature_dim = getattr(self.model, "embed_dim", None)
+        if not isinstance(feature_dim, int) or feature_dim <= 0:
+            raise ValueError(
+                f"DINOv2 model {self.model_name!r} does not expose a valid embed_dim"
+            )
+        self.feature_dim = feature_dim
+        self.static_in_dim = 2 * feature_dim
+        if (
+            self.expected_output_dim is not None
+            and self.expected_output_dim != self.static_in_dim
+        ):
+            raise ValueError(
+                f"--output_dim={self.expected_output_dim} does not match the fused "
+                f"CLS + Patch Mean dimension {self.static_in_dim} for "
+                f"{self.model_name} (token dimension {self.feature_dim})"
+            )
         print(
             f"[action] DINOv2 ready on {self.device} "
-            f"({time.time() - load_start:.1f}s)",
+            f"({time.time() - load_start:.1f}s), token_dim={self.feature_dim}, "
+            f"fused_dim={self.static_in_dim}",
             flush=True,
         )
         self.preprocess = transforms.Compose(
@@ -222,44 +242,57 @@ class DinoV2StaticFeatureExtractor:
             ]
         )
 
-    def fit_output_dim(self, feat):
-        dim = int(feat.shape[-1])
-        if dim == self.output_dim:
-            return feat
-        if not self._warned_dim_fit:
-            print(
-                f"[action][warn] DINO feature dim {dim} != output_dim {self.output_dim}; "
-                "padding/truncating to keep cache shape compatible."
-            )
-            self._warned_dim_fit = True
-        if dim > self.output_dim:
-            return feat[:, : self.output_dim]
-        pad = torch.zeros(
-            feat.shape[0],
-            self.output_dim - dim,
-            device=feat.device,
-            dtype=feat.dtype,
-        )
-        return torch.cat([feat, pad], dim=1)
-
     def forward_features(self, batch):
-        out = self.model.forward_features(batch)
-        if isinstance(out, dict):
-            cls_token = out.get("x_norm_clstoken")
-            patch_tokens = out.get("x_norm_patchtokens")
-            if cls_token is not None and patch_tokens is not None:
-                patch_mean = patch_tokens.mean(dim=1)
-                return torch.cat([cls_token, patch_mean], dim=1)
-            for value in out.values():
-                if torch.is_tensor(value):
-                    return value.reshape(value.shape[0], -1)
-        return self.model(batch).reshape(batch.shape[0], -1)
+        features = self.model.forward_features(batch)
+        if not isinstance(features, dict):
+            raise TypeError(
+                "DINOv2 forward_features must return a dictionary containing "
+                "x_norm_clstoken and x_norm_patchtokens"
+            )
+
+        cls = features.get("x_norm_clstoken")
+        patches = features.get("x_norm_patchtokens")
+        if cls is None or patches is None:
+            raise KeyError(
+                "DINOv2 forward_features output is missing x_norm_clstoken or "
+                "x_norm_patchtokens"
+            )
+        if cls.ndim != 2:
+            raise ValueError(f"Expected CLS shape [B, D], got {tuple(cls.shape)}")
+        if patches.ndim != 3:
+            raise ValueError(
+                f"Expected patch-token shape [B, N, D], got {tuple(patches.shape)}"
+            )
+        if patches.shape[1] == 0:
+            raise ValueError("DINOv2 returned no patch tokens")
+        if cls.shape[0] != patches.shape[0] or cls.shape[-1] != patches.shape[-1]:
+            raise ValueError(
+                "CLS and patch-token batch/feature dimensions do not match: "
+                f"CLS={tuple(cls.shape)}, patches={tuple(patches.shape)}"
+            )
+        if self.feature_dim is not None and cls.shape[-1] != self.feature_dim:
+            raise ValueError(
+                f"DINOv2 token dimension changed from embed_dim={self.feature_dim} "
+                f"to {cls.shape[-1]}"
+            )
+
+        patch_mean = patches.mean(dim=1)
+        fused = torch.cat([cls, patch_mean], dim=-1)
+        if not self._logged_feature_shapes:
+            print(
+                "[action] feature shapes: "
+                f"cls={tuple(cls.shape)}, patches={tuple(patches.shape)}, "
+                f"patch_mean={tuple(patch_mean.shape)}, fused={tuple(fused.shape)}",
+                flush=True,
+            )
+            self._logged_feature_shapes = True
+        return fused
 
     @torch.no_grad()
     def encode_frames(self, frames_rgb):
         self.lazy_init()
         if len(frames_rgb) == 0:
-            return np.zeros((0, self.output_dim), dtype=np.float32)
+            return np.zeros((0, self.static_in_dim), dtype=np.float32)
 
         feats = []
         for start in range(0, len(frames_rgb), self.infer_batch_size):
@@ -274,7 +307,6 @@ class DinoV2StaticFeatureExtractor:
                     feat = self.forward_features(batch)
             else:
                 feat = self.forward_features(batch)
-            feat = self.fit_output_dim(feat)
             feats.append(feat.detach().float().cpu().numpy())
         return np.concatenate(feats, axis=0).astype(np.float32)
 
@@ -419,11 +451,27 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--root_path", type=str, default="../FS1000 Dataset/")
     parser.add_argument("--gpu", type=int, default=0)
-    parser.add_argument("--cache_dir_name", type=str, default="static_dinov2_pool_cache")
-    parser.add_argument("--cache_prefix", type=str, default="static_dinov2_pool")
+    parser.add_argument(
+        "--cache_dir_name",
+        type=str,
+        default="static_dinov2_cls_patch_mean_cache",
+    )
+    parser.add_argument(
+        "--cache_prefix",
+        type=str,
+        default="static_dinov2_cls_patch_mean",
+    )
     parser.add_argument("--split", type=str, default="all", choices=["train", "val", "all"])
     parser.add_argument("--model_name", type=str, default="dinov2_vitl14")
-    parser.add_argument("--output_dim", type=int, default=2048)
+    parser.add_argument(
+        "--output_dim",
+        type=int,
+        default=None,
+        help=(
+            "Optional compatibility check for the fused output dimension. The actual "
+            "dimension is always inferred as 2 * backbone.embed_dim."
+        ),
+    )
     parser.add_argument("--image_size", type=int, default=224)
     parser.add_argument("--infer_batch_size", type=int, default=16)
     parser.add_argument("--decode_batch_size", type=int, default=128)
@@ -432,7 +480,11 @@ def main():
     parser.add_argument("--frames_per_second", type=int, default=2)
     parser.add_argument("--hub_dir", type=str, default=None)
     parser.add_argument("--disable_amp", action="store_true")
-    parser.add_argument("--failed_log_name", type=str, default="static_dinov2_failed_videos.txt")
+    parser.add_argument(
+        "--failed_log_name",
+        type=str,
+        default="static_dinov2_cls_patch_mean_failed_videos.txt",
+    )
     parser.add_argument("--only_data_index", type=str, default=None)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--seed", type=int, default=2026)
