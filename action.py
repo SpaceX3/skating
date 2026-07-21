@@ -36,9 +36,25 @@ def cache_path(cache_dir, cache_prefix, data_index, t_dyn):
     return os.path.join(cache_dir, f"{cache_prefix}_{data_index}_T{t_dyn}.npy")
 
 
+def times_path(cache_dir, cache_prefix, data_index, t_dyn):
+    return os.path.join(
+        cache_dir, f"{cache_prefix}_{data_index}_T{t_dyn}.times.npy"
+    )
+
+
+def window_times_array(windows, sample_first_sec):
+    return np.asarray(
+        [
+            [start, end, start, min(start + sample_first_sec, end)]
+            for _, start, end in windows
+        ],
+        dtype=np.float32,
+    )
+
+
 def already_precomputed_any(cache_dir, cache_prefix, data_index):
     pattern = os.path.join(cache_dir, f"{cache_prefix}_{data_index}_T*.npy")
-    return len(glob(pattern)) > 0
+    return any(not path.endswith(".times.npy") for path in glob(pattern))
 
 
 def append_failed_video(failed_log_path, data_index, video_path, reason):
@@ -365,7 +381,10 @@ class DinoV2StaticFeatureExtractor:
             frame_feats = np.stack([idx_to_feat[int(idx)] for idx in indices], axis=0)
             segment_feats.append(frame_feats.mean(axis=0))
 
-        return np.stack(segment_feats, axis=0).astype(np.float32)
+        return (
+            np.stack(segment_feats, axis=0).astype(np.float32),
+            window_times_array(windows, self.sample_first_sec),
+        )
 
 
 def precompute_split(
@@ -416,10 +435,11 @@ def precompute_split(
             flush=True,
         )
         rng = random.Random(stable_video_seed(seed, data_index))
-        static_feat = extractor.extract(video_path, t_dyn=t_dyn, rng=rng)
-        if static_feat is None:
+        extracted = extractor.extract(video_path, t_dyn=t_dyn, rng=rng)
+        if extracted is None:
             append_failed_video(failed_log_path, data_index, video_path, "video_error")
             continue
+        static_feat, static_times = extracted
         if static_feat.shape != (t_dyn, extractor.static_in_dim):
             raise ValueError(
                 f"Unexpected static feature shape for {data_index}: "
@@ -429,6 +449,10 @@ def precompute_split(
         tmp_path = out_path + f".tmp.{os.getpid()}.{random.randint(0, 1_000_000)}.npy"
         np.save(tmp_path, static_feat)
         os.replace(tmp_path, out_path)
+        out_times_path = times_path(cache_dir, cache_prefix, data_index, t_dyn)
+        tmp_times_path = out_times_path + f".tmp.{os.getpid()}.{random.randint(0, 1_000_000)}.npy"
+        np.save(tmp_times_path, static_times)
+        os.replace(tmp_times_path, out_times_path)
         processed += 1
         print(
             f"[action] saved {out_path}, shape={static_feat.shape}, "
@@ -447,9 +471,113 @@ def precompute_split(
     return processed
 
 
+def finefs_rows(root_path):
+    annotation_dir = os.path.join(root_path, "annotation")
+    return [
+        os.path.splitext(name)[0]
+        for name in sorted(os.listdir(annotation_dir), key=lambda value: int(os.path.splitext(value)[0]))
+        if name.endswith(".json")
+    ]
+
+
+def finefs_segment_count(duration, clip_len, stride):
+    if duration <= clip_len:
+        return 1
+    return int(np.floor((duration - clip_len) / stride)) + 1
+
+
+def precompute_finefs(
+    root_path,
+    extractor,
+    cache_dir,
+    cache_prefix,
+    failed_log_path,
+    only_data_index=None,
+    limit=None,
+    overwrite=False,
+    seed=2026,
+    stride=2.0,
+):
+    from decord import VideoReader, cpu
+
+    rows = finefs_rows(root_path)
+    os.makedirs(cache_dir, exist_ok=True)
+    processed = 0
+    skipped_existing = 0
+    for row_idx, data_index in enumerate(rows):
+        if only_data_index is not None and data_index != only_data_index:
+            continue
+        if limit is not None and processed >= limit:
+            break
+        video_path = os.path.join(root_path, "video", data_index + ".mp4")
+        try:
+            reader = VideoReader(video_path, ctx=cpu(0))
+            duration = float(len(reader)) / max(float(reader.get_avg_fps()), 1e-6)
+            t_dyn = finefs_segment_count(duration, extractor.clip_len, stride)
+        except Exception as exc:
+            append_failed_video(
+                failed_log_path, data_index, video_path, f"metadata_error:{exc}"
+            )
+            continue
+
+        out_path = cache_path(cache_dir, cache_prefix, data_index, t_dyn)
+        out_times_path = times_path(cache_dir, cache_prefix, data_index, t_dyn)
+        if not overwrite and os.path.exists(out_path) and os.path.exists(out_times_path):
+            skipped_existing += 1
+            continue
+        print(
+            f"[action] FineFS {row_idx + 1}/{len(rows)}: {data_index}, "
+            f"duration={duration:.2f}, T={t_dyn}",
+            flush=True,
+        )
+        rng = random.Random(stable_video_seed(seed, "finefs_" + data_index))
+        extracted = extractor.extract(video_path, t_dyn=t_dyn, rng=rng)
+        if extracted is None:
+            append_failed_video(failed_log_path, data_index, video_path, "video_error")
+            continue
+        static_feat, static_times = extracted
+        tmp_path = out_path + f".tmp.{os.getpid()}.{random.randint(0, 1_000_000)}.npy"
+        np.save(tmp_path, static_feat)
+        os.replace(tmp_path, out_path)
+        tmp_times_path = out_times_path + f".tmp.{os.getpid()}.{random.randint(0, 1_000_000)}.npy"
+        np.save(tmp_times_path, static_times)
+        os.replace(tmp_times_path, out_times_path)
+        processed += 1
+    print(
+        f"[action] FineFS done: processed={processed}, existing={skipped_existing}",
+        flush=True,
+    )
+
+
+def build_fs1000_time_sidecars(root_path, cache_dir, cache_prefix, clip_len, sample_first_sec):
+    from decord import VideoReader, cpu
+
+    written = 0
+    for split_name in ("train", "val"):
+        for row in read_split(root_path, split_name):
+            data_index = row[0]
+            t_dyn = read_t_dyn(root_path, data_index)
+            feature_path = cache_path(cache_dir, cache_prefix, data_index, t_dyn)
+            if not os.path.exists(feature_path):
+                raise FileNotFoundError(feature_path)
+            out_times_path = times_path(cache_dir, cache_prefix, data_index, t_dyn)
+            if os.path.exists(out_times_path):
+                continue
+            video_path = os.path.join(root_path, "fs1000", data_index + ".mp4")
+            reader = VideoReader(video_path, ctx=cpu(0))
+            duration = float(len(reader)) / max(float(reader.get_avg_fps()), 1e-6)
+            windows = build_segment_windows(duration, clip_len, t_dyn)
+            np.save(out_times_path, window_times_array(windows, sample_first_sec))
+            written += 1
+    print(f"[action] wrote {written} FS1000 time sidecars", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--root_path", type=str, default="../FS1000 Dataset/")
+    parser.add_argument(
+        "--dataset_mode", choices=["fs1000", "finefs"], default="fs1000"
+    )
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument(
         "--cache_dir_name",
@@ -489,6 +617,8 @@ def main():
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--times_only", action="store_true")
+    parser.add_argument("--finefs_stride", type=float, default=2.0)
     parser.add_argument(
         "--proxy",
         type=str,
@@ -531,6 +661,34 @@ def main():
 
     cache_dir = os.path.join(args.root_path, args.cache_dir_name)
     failed_log_path = os.path.join(args.root_path, args.failed_log_name)
+
+    if args.times_only:
+        if args.dataset_mode != "fs1000":
+            raise ValueError("--times_only currently applies to FS1000 caches")
+        build_fs1000_time_sidecars(
+            args.root_path,
+            cache_dir,
+            args.cache_prefix,
+            args.clip_len,
+            args.sample_first_sec,
+        )
+        return
+
+    if args.dataset_mode == "finefs":
+        precompute_finefs(
+            root_path=args.root_path,
+            extractor=extractor,
+            cache_dir=cache_dir,
+            cache_prefix=args.cache_prefix,
+            failed_log_path=failed_log_path,
+            only_data_index=args.only_data_index,
+            limit=args.limit,
+            overwrite=args.overwrite,
+            seed=args.seed,
+            stride=args.finefs_stride,
+        )
+        print("[action] DINOv2 FineFS precompute finished.", flush=True)
+        return
 
     split_names = []
     if args.split in ("train", "all"):

@@ -1,288 +1,441 @@
-from typing_extensions import final
 import argparse
+import json
+import os
+import random
+from datetime import datetime
+
+import numpy as np
+from scipy.stats import spearmanr
 import torch
 import torch.utils.data as data
-import os
-import sys
-import numpy as np
-from model import scoring_head, head
-from dataset.dataset_fs800 import FeatureDatasetWithStaticCache, av_collate_fn_with_static
-from scipy.stats import spearmanr
-import math
-from datetime import datetime
-# from torch.optim import lr_sheduler
-# import time
-# import warnings
 
-def set_trainable_params_for_stage(model, stage: int, freeze_static_proj_in_stage2: bool = True):
-    """
-    stage=1: freeze dynamic backbone, only train static_proj + time_score_mlp
-    stage=2: train dynamic backbone + time_score_mlp, optional static_proj freeze
-    """
-    if stage == 1:
-        for name, p in model.named_parameters():
-            p.requires_grad = ("static_proj" in name) or ("time_score_mlp" in name)
-    else:
-        for name, p in model.named_parameters():
-            if freeze_static_proj_in_stage2 and ("static_proj" in name):
-                p.requires_grad = False
-            else:
-                p.requires_grad = True
+from action_rag import load_action_corpus
+from dataset.dataset_fs800 import (
+    FeatureDatasetWithStaticCache,
+    av_collate_fn_with_static,
+)
+from model import scoring_head
 
 
-def build_optimizer_and_scheduler(model, lr=1e-4, weight_decay=5e-6, step_size=20, gamma=0.7):
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.Adam(trainable_params, lr=lr, weight_decay=weight_decay)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=step_size, gamma=gamma)
-    return optimizer, scheduler
-
-
-def checkpoint_path(epoch_idx, val_loss, spear):
-    output_dir = "./fs800_result"
-    os.makedirs(output_dir, exist_ok=True)
-    return os.path.join(output_dir, "checkpoint_epoch{}_loss{:.2f}_spear{:.3f}.pth".format(
-        epoch_idx,
-        val_loss,
-        spear,
-    ))
-
-
-def save_best_checkpoint(model, save_path, previous_path):
-    torch.save(model.state_dict(), save_path)
-    if previous_path and previous_path != save_path and os.path.exists(previous_path):
-        os.remove(previous_path)
-    return save_path
-
-
-class Tee:
-    def __init__(self, *streams):
-        self.streams = streams
-
-    def write(self, data):
-        for stream in self.streams:
-            stream.write(data)
-            stream.flush()
-
-    def flush(self):
-        for stream in self.streams:
-            stream.flush()
-
-
-def setup_log_output(log_dir, log_file=None):
-    os.makedirs(log_dir, exist_ok=True)
-    if log_file is None:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_file = os.path.join(log_dir, f"train_{timestamp}.log")
-    else:
-        log_file = os.path.abspath(log_file)
-        os.makedirs(os.path.dirname(log_file) or ".", exist_ok=True)
-
-    log_stream = open(log_file, "a", buffering=1)
-    sys.stdout = Tee(sys.__stdout__, log_stream)
-    sys.stderr = Tee(sys.__stderr__, log_stream)
-    print(f"log file: {log_file}")
-    return log_stream
-
-
-def close_log_output(log_stream):
-    sys.stdout = sys.__stdout__
-    sys.stderr = sys.__stderr__
-    log_stream.close()
-
-def validation(dataloader, model, criterion, score_index, gpu):
-    model.eval()
-    val_loss = 0
-    val_truth = []
-    val_pred = []
-
-
-    for audio_feature, video_feature, inv_audio_feature, inv_video_feature, static_feature, audio_len, video_len, score, data_index in dataloader:
-        batch_size, _, _, _ = audio_feature.shape
-        audio_feature = audio_feature.cuda(device=gpu)
-        video_feature = video_feature.cuda(device=gpu)
-        inv_audio_feature = inv_audio_feature.cuda(device=gpu)
-        inv_video_feature = inv_video_feature.cuda(device=gpu)
-        static_feature = static_feature.cuda(device=gpu)
-        target = score[score_index].cuda(device=gpu)
-
-        with torch.no_grad():
-            output = model(audio_feature, video_feature, inv_audio_feature, inv_video_feature, audio_len, video_len, static_feature)
-        val_pred.append(output.detach().data.cpu().numpy())
-        val_truth.append(target.cpu().numpy())
-
-        loss = criterion(output, target)
-
-        val_loss += loss.item() * batch_size
-
-    val_truth = np.concatenate(val_truth)
-    val_pred = np.concatenate(val_pred)
-    spear = spearmanr(val_truth, val_pred)
-    print(len(dataloader.dataset))
-    val_loss = val_loss / len(dataloader.dataset)
-    return val_loss, spear.correlation
-
-if __name__ == '__main__':
+def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--gpu", type=int, default=0)
-    parser.add_argument("--log-dir", default="./fs800_result")
-    parser.add_argument("--log-file", default=None)
-    parser.add_argument("--root-path", default="../FS1000 Dataset/")
-    parser.add_argument("--static-cache-dir-name", choices = ["static_resnet50_cache", "static_resnet50_keyframe_cache", "static_dinov2_cls_patch_mean_cache"], default="static_dinov2_cls_patch_mean_cache")
-    parser.add_argument("--static-cache-prefix", choices = ["static_resnet50", "static_resnet50_keyframe", "static_dinov2_cls_patch_mean"], default="static_dinov2_cls_patch_mean")
-    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--training-stage", choices=["dynamic", "rag"], required=True)
+    parser.add_argument("--root-path", default="../FS1000 Dataset")
+    parser.add_argument(
+        "--static-cache-dir-name", default="static_dinov2_cls_patch_mean_cache"
+    )
+    parser.add_argument(
+        "--static-cache-prefix", default="static_dinov2_cls_patch_mean"
+    )
+    parser.add_argument("--rag-corpus-path", default="rag_artifacts/action_rag_corpus.pt")
+    parser.add_argument("--candidate-dir", default="rag_artifacts/candidates")
+    parser.add_argument("--dynamic-checkpoint", default=None)
+    parser.add_argument("--init-checkpoint", default=None)
+    parser.add_argument("--output-dir", default="rag_results")
+    parser.add_argument("--run-name", default=None)
+    parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=8)
-    parser.add_argument("--epochs", type=int, default=200)
-    parser.add_argument("--freeze-backbone-epochs", type=int, default=30)
-    parser.add_argument("--freeze-static-proj-in-stage2", action="store_true")
-    parser.add_argument("--score-index", type=int, default=0)
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--weight-decay", type=float, default=5e-6)
+    parser.add_argument("--step-size", type=int, default=30)
+    parser.add_argument("--gamma", type=float, default=0.7)
+    parser.add_argument("--gpu", type=int, default=0)
+    parser.add_argument("--cpu", action="store_true")
+    parser.add_argument("--seed", type=int, default=2026)
+    parser.add_argument("--rag-feature-dim", type=int, default=256)
+    parser.add_argument("--baseline-static-proj-dim", type=int, default=512)
+    parser.add_argument("--rag-delta-max", type=float, default=20.0)
+    parser.add_argument("--delta-l2-weight", type=float, default=1e-4)
     parser.add_argument("--only-data-index", default=None)
-    parser.add_argument("--smoke-test", action="store_true")
-    args = parser.parse_args()
-    gpu = args.gpu
-    log_stream = setup_log_output(args.log_dir, args.log_file)
+    parser.add_argument("--only-train-data-index", default=None)
+    parser.add_argument("--only-val-data-index", default=None)
+    parser.add_argument("--limit-train-batches", type=int, default=None)
+    parser.add_argument("--limit-val-batches", type=int, default=None)
+    return parser.parse_args()
 
-    # build dataset
-    train_dataset = FeatureDatasetWithStaticCache(
-        root_path=args.root_path,
-        is_train=True,
-        cache_dir_name=args.static_cache_dir_name,
-        cache_prefix=args.static_cache_prefix,
-        only_data_index=args.only_data_index,
-    )
-    val_dataset = FeatureDatasetWithStaticCache(
-        root_path=args.root_path,
-        is_train=False,
-        cache_dir_name=args.static_cache_dir_name,
-        cache_prefix=args.static_cache_prefix,
-        only_data_index=args.only_data_index,
-    )
 
-    loader_workers = 0 if args.smoke_test else args.num_workers
-    train_dataloader = data.DataLoader(dataset=train_dataset, batch_size=args.batch_size, num_workers=loader_workers, shuffle=(len(train_dataset) > 0), collate_fn=av_collate_fn_with_static)
-    val_dataloader = data.DataLoader(dataset=val_dataset, batch_size=args.batch_size, num_workers=loader_workers, collate_fn=av_collate_fn_with_static)
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
-    if args.smoke_test:
-        smoke_loader = train_dataloader if len(train_dataset) > 0 else val_dataloader
-        if len(smoke_loader.dataset) == 0:
-            raise ValueError("Smoke test dataset is empty. Check --only-data-index and split files.")
-        batch = next(iter(smoke_loader))
-        static_feature = batch[4]
-        audio_feature = batch[0]
-        video_feature = batch[1]
-        print("smoke data_index:", batch[-1])
-        print("smoke audio shape:", tuple(audio_feature.shape))
-        print("smoke video shape:", tuple(video_feature.shape))
-        print("smoke static shape:", tuple(static_feature.shape))
-        print("smoke static cache dir:", args.static_cache_dir_name)
-        print("smoke static cache prefix:", args.static_cache_prefix)
-        close_log_output(log_stream)
-        sys.exit(0)
 
-    # model
+def checkpoint_state_dict(path, device):
+    checkpoint = torch.load(path, map_location=device)
+    if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+        return checkpoint["state_dict"], checkpoint
+    return checkpoint, {}
+
+
+def load_checkpoint(
+    model, path, device, strict, allowed_missing_prefixes=()
+):
+    state_dict, metadata = checkpoint_state_dict(path, device)
+    if any(key.startswith("module.") for key in state_dict):
+        state_dict = {
+            (key[7:] if key.startswith("module.") else key): value
+            for key, value in state_dict.items()
+        }
+    if strict:
+        model.load_state_dict(state_dict, strict=True)
+        print("loaded checkpoint strictly:", path)
+    else:
+        current = model.state_dict()
+        compatible = {
+            key: value
+            for key, value in state_dict.items()
+            if key in current and current[key].shape == value.shape
+        }
+        result = model.load_state_dict(compatible, strict=False)
+        ignored = sorted(set(state_dict).difference(compatible))
+        invalid_missing = [
+            key
+            for key in result.missing_keys
+            if not key.startswith(tuple(allowed_missing_prefixes))
+        ]
+        print("loaded compatible tensors:", len(compatible), "from", path)
+        print("missing keys:", result.missing_keys)
+        print("ignored checkpoint keys:", ignored)
+        if ignored or invalid_missing:
+            raise RuntimeError(
+                "checkpoint is not baseline-compatible; ignored={} invalid_missing={}".format(
+                    ignored, invalid_missing
+                )
+            )
+    return metadata
+
+
+def configure_trainable(model, stage):
+    if stage == "dynamic":
+        for parameter in model.parameters():
+            parameter.requires_grad = True
+    else:
+        for parameter in model.parameters():
+            parameter.requires_grad = False
+        for parameter in model.rag.parameters():
+            parameter.requires_grad = True
+    trainable = [(name, p.numel()) for name, p in model.named_parameters() if p.requires_grad]
+    print("trainable parameter groups:")
+    for name, count in trainable:
+        print(" ", name, count)
+    print("trainable parameters:", sum(count for _, count in trainable))
+
+
+def build_model(args, device):
+    corpus = None
+    use_rag = args.training_stage == "rag"
+    if use_rag:
+        corpus = load_action_corpus(args.rag_corpus_path)
     model = scoring_head(
         depth=2,
         input_dim=768,
         dim=512,
         input_len=16,
         num_scores=1,
-        use_static_branch=True,
+        use_static_branch=use_rag,
+        use_static_baseline=True,
         static_in_dim=2048,
-        static_proj_dim=512,  #128
-    ).cuda(device=gpu)  #, bidirection=True
+        static_proj_dim=args.rag_feature_dim,
+        baseline_static_proj_dim=args.baseline_static_proj_dim,
+        time_score_dropout=0.2,
+        rag_corpus=corpus,
+        rag_delta_max=args.rag_delta_max,
+    ).to(device)
+    if use_rag:
+        if not args.dynamic_checkpoint:
+            raise ValueError("--dynamic-checkpoint is required for the rag stage")
+        metadata = load_checkpoint(
+            model,
+            args.dynamic_checkpoint,
+            device=device,
+            strict=False,
+            allowed_missing_prefixes=("rag.",),
+        )
+        if metadata.get("training_stage") not in (None, "dynamic"):
+            raise ValueError("RAG must start from a dynamic-stage checkpoint")
+    elif args.init_checkpoint:
+        load_checkpoint(model, args.init_checkpoint, device=device, strict=True)
+    configure_trainable(model, args.training_stage)
+    return model, corpus
 
-    epochs = args.epochs
-    warm_up_epochs = 10
 
-    # two-stage training: stage-1 only trains time_score_mlp, stage-2 trains all params
-    freeze_backbone_epochs = args.freeze_backbone_epochs
-    freeze_static_proj_in_stage2 = args.freeze_static_proj_in_stage2
-    set_trainable_params_for_stage(
-        model,
-        stage=1 if freeze_backbone_epochs > 0 else 2,
-        freeze_static_proj_in_stage2=freeze_static_proj_in_stage2
+def build_loaders(args, use_rag, device):
+    common = dict(
+        root_path=args.root_path,
+        cache_dir_name=args.static_cache_dir_name,
+        cache_prefix=args.static_cache_prefix,
+        candidate_dir=args.candidate_dir if use_rag else None,
+        require_candidates=use_rag,
     )
-    optimizer, scheduler = build_optimizer_and_scheduler(
-        model, lr=args.lr, weight_decay=args.weight_decay, step_size=30, gamma=0.9
+    train_filter = args.only_train_data_index or args.only_data_index
+    val_filter = args.only_val_data_index or args.only_data_index
+    train_dataset = FeatureDatasetWithStaticCache(
+        is_train=True, only_data_index=train_filter, **common
     )
-    if freeze_backbone_epochs > 0:
-        print(f"Stage-1 enabled: train only time_score_mlp for first {freeze_backbone_epochs} epochs.")
+    val_dataset = FeatureDatasetWithStaticCache(
+        is_train=False, only_data_index=val_filter, **common
+    )
+    if not train_dataset or not val_dataset:
+        raise ValueError("train/validation dataset is empty")
+    train_generator = torch.Generator().manual_seed(args.seed)
+    train_loader = data.DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        collate_fn=av_collate_fn_with_static,
+        pin_memory=device.type == "cuda",
+        generator=train_generator,
+    )
+    val_loader = data.DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        collate_fn=av_collate_fn_with_static,
+        pin_memory=device.type == "cuda",
+    )
+    return train_loader, val_loader
 
-    # criterion
-    criterion = torch.nn.MSELoss()
 
-    # other parameter
-    score_index = args.score_index
+def move_batch(batch, device):
+    (
+        audio,
+        video,
+        inv_audio,
+        inv_video,
+        static,
+        static_valid_mask,
+        audio_len,
+        video_len,
+        scores,
+        data_indices,
+        rag_data,
+    ) = batch
+    result = {
+        "audio_feature": audio.to(device, non_blocking=True),
+        "video_feature": video.to(device, non_blocking=True),
+        "inv_audio_feature": inv_audio.to(device, non_blocking=True),
+        "inv_video_feature": inv_video.to(device, non_blocking=True),
+        "audio_len": audio_len,
+        "video_len": video_len,
+        "static_feature": static.to(device, non_blocking=True),
+        "static_valid_mask": static_valid_mask.to(device, non_blocking=True),
+        "target": scores[0].to(device, non_blocking=True),
+        "data_indices": data_indices,
+    }
+    if rag_data is not None:
+        result["candidate_indices"] = rag_data["candidate_indices"].to(
+            device, non_blocking=True
+        )
+        result["candidate_similarities"] = rag_data[
+            "candidate_similarities"
+        ].to(device, non_blocking=True)
+        result["overlap_weights"] = rag_data["overlap_weights"].to(
+            device, non_blocking=True
+        )
+    else:
+        result["candidate_indices"] = None
+        result["candidate_similarities"] = None
+        result["overlap_weights"] = None
+    return result
 
-    min_val_loss = 10000
-    max_spear_cor = 0
-    best_loss_checkpoint = None
-    best_spear_checkpoint = None
 
-    for epoch_idx in range(epochs):
-        if freeze_backbone_epochs > 0 and epoch_idx == freeze_backbone_epochs:
-            set_trainable_params_for_stage(model, stage=2, freeze_static_proj_in_stage2=freeze_static_proj_in_stage2)
-            optimizer, scheduler = build_optimizer_and_scheduler(
-                model, lr=args.lr, weight_decay=args.weight_decay, step_size=20, gamma=0.7
-            )
-            static_msg = "keep static_proj frozen" if freeze_static_proj_in_stage2 else "train static_proj"
-            print(f"Stage-2 enabled: train dynamic backbone + time head, {static_msg}.")
+def forward_batch(model, batch):
+    return model(
+        batch["audio_feature"],
+        batch["video_feature"],
+        batch["inv_audio_feature"],
+        batch["inv_video_feature"],
+        batch["audio_len"],
+        batch["video_len"],
+        static_feature=batch["static_feature"],
+        static_valid_mask=batch["static_valid_mask"],
+        candidate_indices=batch["candidate_indices"],
+        candidate_similarities=batch["candidate_similarities"],
+        overlap_weights=batch["overlap_weights"],
+    )
 
+
+def metrics(truth, prediction):
+    truth = np.asarray(truth)
+    prediction = np.asarray(prediction)
+    return {
+        "mse": float(np.mean((prediction - truth) ** 2)),
+        "mae": float(np.mean(np.abs(prediction - truth))),
+        "spearman": float(spearmanr(truth, prediction).correlation),
+    }
+
+
+def run_epoch(loader, model, device, optimizer=None, delta_l2_weight=0.0, limit=None):
+    training = optimizer is not None
+    if not training:
+        model.eval()
+    elif model.rag is not None:
+        model.eval()
+        model.rag.train()
+    else:
         model.train()
-        print("="*25)
-        print("epoch ", epoch_idx)
-        epoch_train_loss = 0.0
-        train_truth = []
-        train_pred = []
-
-        for audio_feature, video_feature, inv_audio_feature, inv_video_feature, static_feature, audio_len, video_len, score, data_index in train_dataloader:
-            batch_size, _, _, _ = audio_feature.shape
-            audio_feature = audio_feature.cuda(device=gpu)
-            video_feature = video_feature.cuda(device=gpu)
-            inv_audio_feature = inv_audio_feature.cuda(device=gpu)
-            inv_video_feature = inv_video_feature.cuda(device=gpu)
-            static_feature = static_feature.cuda(device=gpu)
-
-            target = score[score_index].cuda(device=gpu)
-
-            train_loss = 0
-            optimizer.zero_grad()
-
-            output = model(audio_feature, video_feature, inv_audio_feature, inv_video_feature, audio_len, video_len, static_feature)
-
-            loss = criterion(output, target)
-            train_loss = loss.item()
-            epoch_train_loss += train_loss * batch_size
-            train_pred.append(output.detach().cpu().numpy())
-            train_truth.append(target.detach().cpu().numpy())
-
-            loss.backward()
-            optimizer.step()
-        train_truth = np.concatenate(train_truth)
-        train_pred = np.concatenate(train_pred)
-        train_spear = spearmanr(train_truth, train_pred).correlation
-        epoch_train_loss = epoch_train_loss / len(train_dataloader.dataset)
-        print("train_loss: ", epoch_train_loss, " | train spear corr: ", train_spear)
-        scheduler.step()
-        # validation
-        val_loss, spear = validation(val_dataloader, model, criterion, score_index, gpu)
-        print("val_loss: ", val_loss, " | spear corr: ", spear)
-        if val_loss < min_val_loss:
-            min_val_loss = val_loss
-            save_path = checkpoint_path(epoch_idx, val_loss, spear)
-            best_loss_checkpoint = save_best_checkpoint(model, save_path, best_loss_checkpoint)
-            print("saved best loss checkpoint: ", save_path)
-        if spear > max_spear_cor:
-            max_spear_cor = spear
-            save_path = checkpoint_path(epoch_idx, val_loss, spear)
-            best_spear_checkpoint = save_best_checkpoint(model, save_path, best_spear_checkpoint)
-            print("saved best spear checkpoint: ", save_path)
-
-        print("min validation loss: ", min_val_loss, " | max spear corr: ", max_spear_cor)
-        print("checkpoint")
+    truth = []
+    final_prediction = []
+    baseline_prediction = []
+    deltas = []
+    valid_evidence = []
+    total_loss = 0.0
+    samples = 0
+    for batch_index, raw_batch in enumerate(loader):
+        if limit is not None and batch_index >= limit:
+            break
+        batch = move_batch(raw_batch, device)
+        if training:
+            optimizer.zero_grad(set_to_none=True)
+        with torch.set_grad_enabled(training):
+            output = forward_batch(model, batch)
+            final_loss = torch.nn.functional.mse_loss(output["score"], batch["target"])
+            delta_regularizer = output["delta_tes_rag"].pow(2).mean()
+            loss = final_loss + delta_l2_weight * delta_regularizer
+            if training:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    [p for p in model.parameters() if p.requires_grad], 5.0
+                )
+                optimizer.step()
+        batch_size = batch["target"].shape[0]
+        total_loss += float(loss.detach()) * batch_size
+        samples += batch_size
+        truth.extend(batch["target"].detach().cpu().tolist())
+        final_prediction.extend(output["score"].detach().cpu().tolist())
+        baseline_prediction.extend(output["tes_baseline"].detach().cpu().tolist())
+        deltas.extend(output["delta_tes_rag"].detach().cpu().tolist())
+        if "evidence_valid_mask" in output:
+            valid_evidence.extend(
+                output["evidence_valid_mask"].detach().cpu().float().tolist()
+            )
+    if samples == 0:
+        raise ValueError("epoch processed zero samples")
+    result = {
+        "loss": total_loss / samples,
+        "final": metrics(truth, final_prediction),
+        "baseline": metrics(truth, baseline_prediction),
+        "delta_mean": float(np.mean(deltas)),
+        "delta_std": float(np.std(deltas)),
+        "evidence_valid_ratio": float(np.mean(valid_evidence)) if valid_evidence else 0.0,
+        "samples": samples,
+    }
+    return result
 
 
-        print(optimizer.param_groups[0]['lr'])
-        # scheduler.step()
+def save_checkpoint(path, model, args, corpus, epoch, validation):
+    state = {
+        "state_dict": model.state_dict(),
+        "training_stage": args.training_stage,
+        "epoch": epoch,
+        "validation": validation,
+        "config": vars(args),
+        "corpus_version": None if corpus is None else corpus["metadata_version"],
+    }
+    torch.save(state, path)
 
+
+def main():
+    args = parse_args()
+    set_seed(args.seed)
+    device = torch.device(
+        "cpu" if args.cpu or not torch.cuda.is_available() else f"cuda:{args.gpu}"
+    )
+    os.makedirs(args.output_dir, exist_ok=True)
+    run_name = args.run_name or f"{args.training_stage}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    log_path = os.path.join(args.output_dir, run_name + ".jsonl")
+    model, corpus = build_model(args, device)
+    train_loader, val_loader = build_loaders(
+        args, args.training_stage == "rag", device
+    )
+    learning_rate = args.lr
+    if learning_rate is None:
+        learning_rate = 1e-4 if args.training_stage == "dynamic" else 3e-4
+    optimizer = torch.optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad],
+        lr=learning_rate,
+        weight_decay=args.weight_decay,
+    )
+    scheduler = torch.optim.lr_scheduler.StepLR(
+        optimizer, step_size=args.step_size, gamma=args.gamma
+    )
+    best_spearman = -float("inf")
+    best_path = None
+    print("device:", device)
+    print("train samples:", len(train_loader.dataset))
+    print("validation samples:", len(val_loader.dataset))
+    print("log:", log_path)
+
+    with open(log_path, "w", encoding="utf-8") as log_handle:
+        initial_validation = run_epoch(
+            val_loader,
+            model,
+            device,
+            optimizer=None,
+            limit=args.limit_val_batches,
+        )
+        initial_record = {"epoch": -1, "initial_validation": initial_validation}
+        print(json.dumps(initial_record, ensure_ascii=False))
+        log_handle.write(json.dumps(initial_record, ensure_ascii=False) + "\n")
+        log_handle.flush()
+        for epoch in range(args.epochs):
+            train_result = run_epoch(
+                train_loader,
+                model,
+                device,
+                optimizer=optimizer,
+                delta_l2_weight=(
+                    args.delta_l2_weight if args.training_stage == "rag" else 0.0
+                ),
+                limit=args.limit_train_batches,
+            )
+            val_result = run_epoch(
+                val_loader,
+                model,
+                device,
+                optimizer=None,
+                limit=args.limit_val_batches,
+            )
+            record = {
+                "epoch": epoch,
+                "lr": optimizer.param_groups[0]["lr"],
+                "train": train_result,
+                "validation": val_result,
+            }
+            print(json.dumps(record, ensure_ascii=False))
+            log_handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            log_handle.flush()
+            current_spearman = val_result["final"]["spearman"]
+            is_better = best_path is None or (
+                np.isfinite(current_spearman)
+                and (
+                    not np.isfinite(best_spearman)
+                    or current_spearman > best_spearman
+                )
+            )
+            if is_better:
+                best_spearman = current_spearman
+                best_path = os.path.join(
+                    args.output_dir,
+                    (
+                        f"{run_name}_best_epoch{epoch + 1:03d}"
+                        f"_loss{val_result['loss']:.4f}"
+                        f"_spear{current_spearman:.4f}.pth"
+                    ),
+                )
+                save_checkpoint(
+                    best_path, model, args, corpus, epoch, val_result
+                )
+                print("saved best checkpoint:", best_path)
+            scheduler.step()
+    print("best validation spearman:", best_spearman)
+    print("best checkpoint:", best_path)
+
+
+if __name__ == "__main__":
+    main()

@@ -113,10 +113,21 @@ def av_collate_fn(batch):
 
 
 class FeatureDatasetWithStaticCache(data.Dataset):
-    def __init__(self, root_path, is_train=True, cache_dir_name="static_resnet50_cache", cache_prefix="static_resnet50", only_data_index=None):
+    def __init__(
+        self,
+        root_path,
+        is_train=True,
+        cache_dir_name="static_resnet50_cache",
+        cache_prefix="static_resnet50",
+        only_data_index=None,
+        candidate_dir=None,
+        require_candidates=False,
+    ):
         self.root_path = root_path
         self.cache_dir = os.path.join(root_path, cache_dir_name)
         self.cache_prefix = cache_prefix
+        self.candidate_dir = candidate_dir
+        self.require_candidates = bool(require_candidates)
         split_name = 'train_fs800.txt' if is_train else 'val_fs800.txt'
         file_path = os.path.join(root_path, split_name)
         with open(file_path, 'r') as f:
@@ -143,6 +154,60 @@ class FeatureDatasetWithStaticCache(data.Dataset):
         if not os.path.exists(static_path):
             raise FileNotFoundError(f"Missing static feature cache: {static_path}")
         static_feature = torch.from_numpy(np.load(static_path))
+        if static_feature.shape[0] != t_dyn:
+            raise ValueError(
+                f"Static/dynamic length mismatch for {data_index}: "
+                f"static={static_feature.shape[0]} dynamic={t_dyn}"
+            )
+
+        rag_data = None
+        if self.candidate_dir is not None:
+            candidate_path = os.path.join(self.candidate_dir, data_index + ".npz")
+            if not os.path.exists(candidate_path):
+                if self.require_candidates:
+                    raise FileNotFoundError(f"Missing RAG candidates: {candidate_path}")
+            else:
+                with np.load(candidate_path, allow_pickle=False) as payload:
+                    candidate_indices = payload["candidate_indices"].astype(np.int64)
+                    candidate_similarities = payload[
+                        "candidate_similarities"
+                    ].astype(np.float32)
+                if candidate_indices.shape != candidate_similarities.shape:
+                    raise ValueError(
+                        f"Candidate shape mismatch for {data_index}: "
+                        f"{candidate_indices.shape} vs {candidate_similarities.shape}"
+                    )
+                if candidate_indices.shape[0] != t_dyn:
+                    raise ValueError(
+                        f"Candidate/dynamic length mismatch for {data_index}: "
+                        f"candidate={candidate_indices.shape[0]} dynamic={t_dyn}"
+                    )
+                rag_data = {
+                    "candidate_indices": torch.from_numpy(candidate_indices),
+                    "candidate_similarities": torch.from_numpy(
+                        candidate_similarities
+                    ),
+                }
+                times_path = static_path[:-4] + ".times.npy"
+                if not os.path.exists(times_path):
+                    raise FileNotFoundError(
+                        f"Missing static time sidecar for RAG: {times_path}"
+                    )
+                times = np.load(times_path).astype(np.float32)
+                if times.shape != (t_dyn, 4):
+                    raise ValueError(
+                        f"Unexpected time sidecar shape for {data_index}: {times.shape}"
+                    )
+                dynamic_start = times[:, 0][None, :]
+                dynamic_end = times[:, 1][None, :]
+                sample_start = times[:, 2][:, None]
+                sample_end = times[:, 3][:, None]
+                overlap = np.maximum(
+                    0.0,
+                    np.minimum(sample_end, dynamic_end)
+                    - np.maximum(sample_start, dynamic_start),
+                ).astype(np.float32)
+                rag_data["overlap_weights"] = torch.from_numpy(overlap)
 
         tes = float(data_info[1])
         pcs = float(data_info[2])
@@ -154,7 +219,7 @@ class FeatureDatasetWithStaticCache(data.Dataset):
         factor = float(data_info[8])
         pcs = pcs / factor
 
-        return audio_feature, video_feature, tes, pcs, ss, trans, perform, composition, interpretation, static_feature, data_index
+        return audio_feature, video_feature, tes, pcs, ss, trans, perform, composition, interpretation, static_feature, data_index, rag_data
 
     def __len__(self):
         return len(self.total_data)
@@ -174,6 +239,7 @@ def av_collate_fn_with_static(batch):
     interpretation = [item[8] for item in batch]
     static_features = [item[9] for item in batch]
     data_index = [item[10] for item in batch]
+    rag_items = [item[11] for item in batch]
 
     audio_len = [item[0].shape[0] for item in batch]
     video_len = [item[1].shape[0] for item in batch]
@@ -185,6 +251,41 @@ def av_collate_fn_with_static(batch):
     inv_audios = torch.unsqueeze(inv_audios, dim=2)
     inv_videos = pad_sequence(inv_videos, batch_first=True)
     static_features = pad_sequence(static_features, batch_first=True)
+    max_static_len = static_features.shape[1]
+    static_valid_mask = torch.zeros(
+        len(batch), max_static_len, dtype=torch.bool
+    )
+    for row, feature in enumerate([item[9] for item in batch]):
+        static_valid_mask[row, : feature.shape[0]] = True
+
+    rag_data = None
+    if any(item is not None for item in rag_items):
+        if not all(item is not None for item in rag_items):
+            raise ValueError("A batch cannot mix samples with and without RAG candidates")
+        top_k = rag_items[0]["candidate_indices"].shape[1]
+        candidate_indices = torch.full(
+            (len(batch), max_static_len, top_k), -1, dtype=torch.long
+        )
+        candidate_similarities = torch.zeros(
+            (len(batch), max_static_len, top_k), dtype=torch.float32
+        )
+        overlap_weights = torch.zeros(
+            (len(batch), max_static_len, max_static_len), dtype=torch.float32
+        )
+        for row, item in enumerate(rag_items):
+            length = item["candidate_indices"].shape[0]
+            if item["candidate_indices"].shape[1] != top_k:
+                raise ValueError("RAG candidate top-k differs within a batch")
+            candidate_indices[row, :length] = item["candidate_indices"]
+            candidate_similarities[row, :length] = item[
+                "candidate_similarities"
+            ]
+            overlap_weights[row, :length, :length] = item["overlap_weights"]
+        rag_data = {
+            "candidate_indices": candidate_indices,
+            "candidate_similarities": candidate_similarities,
+            "overlap_weights": overlap_weights,
+        }
 
     tes = torch.FloatTensor(tes)
     pcs = torch.FloatTensor(pcs)
@@ -195,7 +296,19 @@ def av_collate_fn_with_static(batch):
     interpretation = torch.FloatTensor(interpretation)
     scores = [tes, pcs, ss, trans, perform, composition, interpretation]
 
-    return audios, videos, inv_audios, inv_videos, static_features, audio_len, video_len, scores, data_index
+    return (
+        audios,
+        videos,
+        inv_audios,
+        inv_videos,
+        static_features,
+        static_valid_mask,
+        audio_len,
+        video_len,
+        scores,
+        data_index,
+        rag_data,
+    )
 
 
 

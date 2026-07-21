@@ -7,3 +7,5 @@ __pycache__/
 keyframe_selector/outputs/
 static_resnet50_cache/
 static_resnet50_keyframe_cache*/
+rag_artifacts/
+rag_results/
