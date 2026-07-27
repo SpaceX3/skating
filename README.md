@@ -84,6 +84,36 @@ the start time, for example
 The last command disables the RAG residual in the same checkpoint, providing a
 matched dynamic-only control for the final evaluation.
 
+## FineFS semantic supervision stage
+
+Before TES residual training, FineFS can now directly supervise action
+retrieval, citation reranking, action/background recognition and GOE. The split
+is video-disjoint and immutable by default. Only FineFS-train videos form the
+reference bank; train queries exclude their own video, while validation and
+test videos never enter the bank.
+
+```bash
+# Create the deterministic 70/15/15 video split once.
+bash scripts/run_action_rag.sh semantic-split
+
+# Short real-corpus check before a full run.
+TRAIN_GPU=0 bash scripts/run_action_rag.sh semantic-smoke
+
+# Full semantic training.
+TRAIN_GPU=0 bash scripts/run_action_rag.sh train-semantic
+
+# Validation and held-out FineFS test evaluation.
+SEMANTIC_CHECKPOINT=/absolute/path/to/semantic_best.pth TRAIN_GPU=0 \
+  bash scripts/run_action_rag.sh semantic-val
+SEMANTIC_CHECKPOINT=/absolute/path/to/semantic_best.pth TRAIN_GPU=0 \
+  bash scripts/run_action_rag.sh semantic-test
+```
+
+The semantic checkpoint is independent of previous RAG checkpoints. It uses a
+2048 -> 512 -> 256 DINO query encoder and stores the full retrieval/citation/GOE
+model for a newly trained TES stage. FineFS test labels are used only for final
+semantic metrics.
+
 `preprocess-all` is intentionally separate from training because FineFS DINO
 feature extraction covers 1167 long videos and can take several hours. The
 step is resumable and skips completed feature/time pairs.

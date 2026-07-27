@@ -12,6 +12,7 @@ import torch.nn.functional as F
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from action_rag import load_action_corpus
+from semantic_rag import FineFSSemanticRAG
 
 
 def rounded(values):
@@ -116,6 +117,7 @@ def main():
         "--query-cache-prefix", default="static_dinov2_cls_patch_mean"
     )
     parser.add_argument("--corpus", default="rag_artifacts/action_rag_corpus.pt")
+    parser.add_argument("--semantic-checkpoint", required=True)
     parser.add_argument("--output-dir", default="rag_artifacts/candidates")
     parser.add_argument("--top-k", type=int, default=8)
     parser.add_argument("--dedup-pool-size", type=int, default=64)
@@ -130,12 +132,36 @@ def main():
         raise ValueError("require 0 < top-k <= dedup-pool-size")
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     corpus = load_action_corpus(args.corpus)
+    checkpoint = torch.load(args.semantic_checkpoint, map_location=device)
+    config = checkpoint.get("config", {})
+    semantic = FineFSSemanticRAG(
+        coarse_classes=len(corpus["coarse_class_vocab"]),
+        elements=len(corpus["element_vocab"]),
+        query_dim=corpus["keys"].shape[1],
+        evidence_dim=int(config.get("evidence_dim", 256)),
+        encoder_hidden_dim=int(config.get("encoder_hidden_dim", 512)),
+        metadata_dim=int(config.get("metadata_dim", 64)),
+        temperature=float(config.get("temperature", 0.07)),
+        dropout=float(config.get("dropout", 0.1)),
+    ).to(device)
+    semantic.load_state_dict(checkpoint["state_dict"], strict=True)
+    semantic.eval()
     corpus_keys = corpus["keys"].to(device)
+    coarse_ids = corpus["coarse_class_ids"].to(device)
+    element_ids = corpus["element_ids"].to(device)
+    goe = corpus["goe_grades"].to(device)
+    bv = corpus["bvs"].to(device)
+    panel = corpus["panel_scores"].to(device)
+    with torch.inference_mode():
+        _, reference_retrieval, _ = semantic.encode_reference(
+            corpus_keys, coarse_ids, element_ids, goe, bv, panel
+        )
     exact_video_map = build_exact_video_map(args.finefs_root, args.fs1000_root)
     corpus_video_ids = np.asarray(corpus["video_ids"], dtype=object)
     os.makedirs(args.output_dir, exist_ok=True)
     print("device", device)
     print("corpus_keys", tuple(corpus_keys.shape))
+    print("semantic_checkpoint", args.semantic_checkpoint)
     print("exact_video_exclusions", len(exact_video_map))
 
     splits = ("train", "val") if args.split == "all" else (args.split,)
@@ -154,8 +180,17 @@ def main():
                 args.query_cache_dir, args.query_cache_prefix, data_index
             )
             query = torch.from_numpy(np.load(feature_path).astype(np.float32))
-            query = F.normalize(query, dim=-1).to(device)
-            similarities = query @ corpus_keys.T
+            query = F.normalize(query.to(device), dim=-1)
+            with torch.inference_mode():
+                query_token, query_retrieval = semantic.encode_query(query)
+                element_logits = semantic.element_head(query_token)
+                similarities = semantic.retrieval_scores(
+                    query_retrieval,
+                    element_logits,
+                    reference_retrieval,
+                    element_ids,
+                )
+            similarities = similarities.clone()
             excluded_video_id = exact_video_map.get(data_index)
             excluded_count = 0
             if excluded_video_id is not None:
@@ -177,6 +212,8 @@ def main():
                 candidate_indices=indices.numpy(),
                 candidate_similarities=values.numpy(),
                 corpus_version=np.asarray(corpus["metadata_version"]),
+                retrieval_model=np.asarray("finefs-semantic-rag"),
+                semantic_checkpoint=np.asarray(os.path.basename(args.semantic_checkpoint)),
                 source_feature=os.path.basename(feature_path),
                 excluded_finefs_video=np.asarray(excluded_video_id or ""),
             )

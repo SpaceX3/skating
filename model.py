@@ -3,7 +3,8 @@ from functools import partial
 import torch
 from torch import nn
 
-from action_rag import EvidenceRAG, masked_mean
+from action_rag import SemanticEvidenceRAG, masked_mean
+from semantic_rag import FineFSSemanticRAG
 
 
 def FeedForward(dim, expansion_factor=4, dropout=0.0, dense=nn.Linear):
@@ -41,8 +42,10 @@ class scoring_head(nn.Module):
         static_in_dim=2048,
         static_proj_dim=256,
         baseline_static_proj_dim=512,
+        baseline_head_type="metric",
         time_score_dropout=0.2,
         rag_corpus=None,
+        rag_semantic_model=None,
         rag_delta_max=20.0,
     ):
         super().__init__()
@@ -51,6 +54,9 @@ class scoring_head(nn.Module):
         self.dim = int(dim)
         self.use_static_branch = bool(use_static_branch)
         self.use_static_baseline = bool(use_static_baseline)
+        self.baseline_head_type = str(baseline_head_type)
+        if self.baseline_head_type not in ("metric", "legacy-womean"):
+            raise ValueError("unknown baseline_head_type: {}".format(baseline_head_type))
 
         self.hidden_state = nn.Parameter(torch.randn(1, dim))
         self.cls_token = nn.Parameter(torch.randn(1, dim))
@@ -81,23 +87,39 @@ class scoring_head(nn.Module):
         if self.use_static_baseline:
             self.static_proj = nn.Linear(static_in_dim, baseline_static_proj_dim)
             baseline_input_dim += baseline_static_proj_dim
-        self.time_score_mlp = nn.Sequential(
-            nn.LayerNorm(baseline_input_dim),
-            nn.Linear(baseline_input_dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(time_score_dropout),
-            nn.Linear(hidden_dim, num_scores),
-        )
+        if self.baseline_head_type == "legacy-womean":
+            legacy_hidden = max(dim // 4, 1)
+            self.time_score_mlp = nn.Sequential(
+                nn.Linear(baseline_input_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, legacy_hidden),
+                nn.GELU(),
+                nn.Linear(legacy_hidden, num_scores),
+            )
+        else:
+            self.time_score_mlp = nn.Sequential(
+                nn.LayerNorm(baseline_input_dim),
+                nn.Linear(baseline_input_dim, hidden_dim),
+                nn.GELU(),
+                nn.Dropout(time_score_dropout),
+                nn.Linear(hidden_dim, num_scores),
+            )
 
         self.rag = None
         if self.use_static_branch:
             if rag_corpus is None:
                 raise ValueError("rag_corpus is required when use_static_branch=True")
-            self.rag = EvidenceRAG(
+            if rag_semantic_model is None:
+                rag_semantic_model = FineFSSemanticRAG(
+                    coarse_classes=len(rag_corpus["coarse_class_vocab"]),
+                    elements=len(rag_corpus["element_vocab"]),
+                    query_dim=static_in_dim,
+                    evidence_dim=static_proj_dim,
+                )
+            self.rag = SemanticEvidenceRAG(
                 corpus=rag_corpus,
+                semantic_model=rag_semantic_model,
                 dynamic_dim=dim,
-                query_dim=static_in_dim,
-                evidence_dim=static_proj_dim,
                 delta_max=rag_delta_max,
             )
 
@@ -260,6 +282,7 @@ class scoring_head(nn.Module):
                 candidate_indices=candidate_indices,
                 candidate_similarities=candidate_similarities,
                 overlap_weights=overlap_weights,
+                tes_baseline=tes_baseline,
             )
             output.update(rag_output)
             output["score"] = tes_baseline + rag_output["delta_tes_rag"]

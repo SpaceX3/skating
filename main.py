@@ -15,6 +15,7 @@ from dataset.dataset_fs800 import (
     av_collate_fn_with_static,
 )
 from model import scoring_head
+from semantic_rag import FineFSSemanticRAG
 
 
 def parse_args():
@@ -29,7 +30,8 @@ def parse_args():
     )
     parser.add_argument("--rag-corpus-path", default="rag_artifacts/action_rag_corpus.pt")
     parser.add_argument("--candidate-dir", default="rag_artifacts/candidates")
-    parser.add_argument("--dynamic-checkpoint", default=None)
+    parser.add_argument("--dynamic-checkpoint", default="/home/v100/ZYQ/skating/rag_results/dynamic/dynamic_seed2026_20260724_004400_best_epoch080_loss83.0444_spear0.8658.pth")
+    parser.add_argument("--semantic-checkpoint", default="/home/v100/ZYQ/skating/rag_results/semantic/semantic_seed2026_20260723_160005_best_epoch050_mrr0.2570_goemae1.3456.pth")
     parser.add_argument("--init-checkpoint", default=None)
     parser.add_argument("--output-dir", default="rag_results")
     parser.add_argument("--run-name", default=None)
@@ -45,6 +47,11 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--rag-feature-dim", type=int, default=256)
     parser.add_argument("--baseline-static-proj-dim", type=int, default=512)
+    parser.add_argument(
+        "--baseline-head-type",
+        choices=["metric", "legacy-womean"],
+        default="metric",
+    )
     parser.add_argument("--rag-delta-max", type=float, default=20.0)
     parser.add_argument("--delta-l2-weight", type=float, default=1e-4)
     parser.add_argument("--only-data-index", default=None)
@@ -117,6 +124,8 @@ def configure_trainable(model, stage):
             parameter.requires_grad = False
         for parameter in model.rag.parameters():
             parameter.requires_grad = True
+        for parameter in model.rag.semantic.parameters():
+            parameter.requires_grad = False
     trainable = [(name, p.numel()) for name, p in model.named_parameters() if p.requires_grad]
     print("trainable parameter groups:")
     for name, count in trainable:
@@ -129,6 +138,30 @@ def build_model(args, device):
     use_rag = args.training_stage == "rag"
     if use_rag:
         corpus = load_action_corpus(args.rag_corpus_path)
+        if not args.semantic_checkpoint:
+            raise ValueError("--semantic-checkpoint is required for the rag stage")
+        semantic_checkpoint = torch.load(args.semantic_checkpoint, map_location=device)
+        semantic_config = semantic_checkpoint.get("config", {})
+        semantic_model = FineFSSemanticRAG(
+            coarse_classes=len(corpus["coarse_class_vocab"]),
+            elements=len(corpus["element_vocab"]),
+            query_dim=corpus["keys"].shape[1],
+            evidence_dim=int(semantic_config.get("evidence_dim", 256)),
+            encoder_hidden_dim=int(semantic_config.get("encoder_hidden_dim", 512)),
+            metadata_dim=int(semantic_config.get("metadata_dim", 64)),
+            temperature=float(semantic_config.get("temperature", 0.07)),
+            dropout=float(semantic_config.get("dropout", 0.1)),
+        ).to(device)
+        semantic_model.load_state_dict(semantic_checkpoint["state_dict"], strict=True)
+        semantic_model.eval()
+        print("loaded frozen semantic checkpoint:", args.semantic_checkpoint)
+        args.semantic_evidence_dim = int(semantic_config.get("evidence_dim", 256))
+        args.semantic_encoder_hidden_dim = int(semantic_config.get("encoder_hidden_dim", 512))
+        args.semantic_metadata_dim = int(semantic_config.get("metadata_dim", 64))
+        args.semantic_temperature = float(semantic_config.get("temperature", 0.07))
+        args.semantic_dropout = float(semantic_config.get("dropout", 0.1))
+    else:
+        semantic_model = None
     model = scoring_head(
         depth=2,
         input_dim=768,
@@ -140,8 +173,10 @@ def build_model(args, device):
         static_in_dim=2048,
         static_proj_dim=args.rag_feature_dim,
         baseline_static_proj_dim=args.baseline_static_proj_dim,
+        baseline_head_type=args.baseline_head_type,
         time_score_dropout=0.2,
         rag_corpus=corpus,
+        rag_semantic_model=semantic_model,
         rag_delta_max=args.rag_delta_max,
     ).to(device)
     if use_rag:
@@ -157,7 +192,7 @@ def build_model(args, device):
         if metadata.get("training_stage") not in (None, "dynamic"):
             raise ValueError("RAG must start from a dynamic-stage checkpoint")
     elif args.init_checkpoint:
-        load_checkpoint(model, args.init_checkpoint, device=device, strict=True)
+        load_checkpoint(model, args.init_checkpoint, device=device, strict=False)
     configure_trainable(model, args.training_stage)
     return model, corpus
 

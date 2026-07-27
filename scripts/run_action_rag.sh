@@ -9,12 +9,16 @@ ACTION_PY="${ACTION_PY:-/home/v100/anaconda3/envs/skating-action/bin/python}"
 PREPROCESS_GPU="${PREPROCESS_GPU:-0}"
 TRAIN_GPU="${TRAIN_GPU:-1}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
+SEMANTIC_NUM_WORKERS="${SEMANTIC_NUM_WORKERS:-0}"
+SEMANTIC_BATCH_SIZE="${SEMANTIC_BATCH_SIZE:-512}"
 SEED="${SEED:-2026}"
 TOP_K="${TOP_K:-8}"
 FINEFS_CACHE="${FINEFS_CACHE:-$FINEFS_ROOT/static_dinov2_cls_patch_mean_rag_cache}"
 CORPUS="${CORPUS:-$PROJECT_ROOT/rag_artifacts/action_rag_corpus.pt}"
 CANDIDATES="${CANDIDATES:-$PROJECT_ROOT/rag_artifacts/candidates}"
 RESULTS="${RESULTS:-$PROJECT_ROOT/rag_results}"
+SEMANTIC_SPLIT="${SEMANTIC_SPLIT:-$PROJECT_ROOT/rag_artifacts/finefs_semantic_split.json}"
+SEMANTIC_RESULTS="${SEMANTIC_RESULTS:-$RESULTS/semantic}"
 INIT_CHECKPOINT="${INIT_CHECKPOINT:-$PROJECT_ROOT/fs800_result/checkpoint_epoch42_loss112.53_spear0.879.pth}"
 
 cd "$PROJECT_ROOT"
@@ -30,6 +34,11 @@ Usage:
   bash scripts/run_action_rag.sh audit-retrieval
   bash scripts/run_action_rag.sh candidates
   bash scripts/run_action_rag.sh preprocess-all
+  bash scripts/run_action_rag.sh semantic-split
+  bash scripts/run_action_rag.sh semantic-smoke
+  bash scripts/run_action_rag.sh train-semantic
+  SEMANTIC_CHECKPOINT=/path/to/semantic_best.pth bash scripts/run_action_rag.sh semantic-val
+  SEMANTIC_CHECKPOINT=/path/to/semantic_best.pth bash scripts/run_action_rag.sh semantic-test
   bash scripts/run_action_rag.sh train-dynamic
   DYNAMIC_CHECKPOINT=/path/to/dynamic_best.pth bash scripts/run_action_rag.sh train-rag
   CHECKPOINT=/path/to/checkpoint.pth bash scripts/run_action_rag.sh evaluate
@@ -37,20 +46,108 @@ Usage:
 
 Optional environment variables:
   PREPROCESS_GPU=0 TRAIN_GPU=1 NUM_WORKERS=8 SEED=2026 TOP_K=8
+  SEMANTIC_BATCH_SIZE=512 SEMANTIC_NUM_WORKERS=0
   INIT_CHECKPOINT=/path/to/legacy_checkpoint.pth
   DYNAMIC_CHECKPOINT=/path/to/dynamic_best.pth
   CHECKPOINT=/path/to/evaluation_checkpoint.pth
+  SEMANTIC_CHECKPOINT=/path/to/finefs_semantic_best.pth
 EOF
 }
 
 run_test() {
   "$ACTION_PY" -m py_compile \
-    model.py action_rag.py main.py eval.py action.py \
+    model.py action_rag.py semantic_rag.py semantic_data.py semantic_main.py \
+    main.py eval.py action.py \
     dataset/dataset_fs800.py \
     scripts/build_action_rag_corpus.py \
     scripts/precompute_action_candidates.py \
     scripts/audit_action_retrieval.py
-  "$ACTION_PY" -m unittest -v tests/test_action_rag.py
+  "$ACTION_PY" -m unittest discover -v tests
+}
+
+semantic_split() {
+  if [[ -f "$SEMANTIC_SPLIT" ]]; then
+    echo "FineFS semantic split already exists: $SEMANTIC_SPLIT"
+    echo "Delete it explicitly or call semantic_main.py --overwrite-split to replace it."
+    return
+  fi
+  "$ACTION_PY" semantic_main.py \
+    --mode split \
+    --corpus "$CORPUS" \
+    --split-path "$SEMANTIC_SPLIT" \
+    --train-ratio 0.70 \
+    --val-ratio 0.15 \
+    --seed "$SEED"
+}
+
+train_semantic() {
+  [[ -f "$SEMANTIC_SPLIT" ]] || semantic_split
+  local run_name="semantic_seed${SEED}_$(date +%Y%m%d_%H%M%S)"
+  mkdir -p "$SEMANTIC_RESULTS"
+  "$ACTION_PY" semantic_main.py \
+    --mode train \
+    --corpus "$CORPUS" \
+    --split-path "$SEMANTIC_SPLIT" \
+    --output-dir "$SEMANTIC_RESULTS" \
+    --run-name "$run_name" \
+    --batch-size "$SEMANTIC_BATCH_SIZE" \
+    --num-workers "$SEMANTIC_NUM_WORKERS" \
+    --epochs 200 \
+    --lr 3e-4 \
+    --candidate-count 32 \
+    --positive-count 4 \
+    --top-k "$TOP_K" \
+    --retrieval-pool 64 \
+    --evidence-dim 256 \
+    --encoder-hidden-dim 512 \
+    --metadata-dim 64 \
+    --dropout 0.1 \
+    --gpu "$TRAIN_GPU" \
+    --seed "$SEED"
+}
+
+evaluate_semantic() {
+  local split="$1"
+  : "${SEMANTIC_CHECKPOINT:?Set SEMANTIC_CHECKPOINT to a semantic-stage best checkpoint}"
+  "$ACTION_PY" semantic_main.py \
+    --mode eval \
+    --corpus "$CORPUS" \
+    --split-path "$SEMANTIC_SPLIT" \
+    --checkpoint "$SEMANTIC_CHECKPOINT" \
+    --eval-split "$split" \
+    --batch-size 128 \
+    --num-workers "$SEMANTIC_NUM_WORKERS" \
+    --top-k "$TOP_K" \
+    --retrieval-pool 64 \
+    --gpu "$TRAIN_GPU" \
+    --seed "$SEED"
+}
+
+semantic_smoke() {
+  [[ -f "$SEMANTIC_SPLIT" ]] || semantic_split
+  mkdir -p "$SEMANTIC_RESULTS/smoke"
+  "$ACTION_PY" semantic_main.py \
+    --mode train \
+    --corpus "$CORPUS" \
+    --split-path "$SEMANTIC_SPLIT" \
+    --output-dir "$SEMANTIC_RESULTS/smoke" \
+    --run-name "semantic_smoke" \
+    --batch-size 8 \
+    --num-workers 0 \
+    --epochs 1 \
+    --candidate-count 8 \
+    --positive-count 2 \
+    --top-k 4 \
+    --retrieval-pool 16 \
+    --reference-batch-size 512 \
+    --evidence-dim 256 \
+    --encoder-hidden-dim 512 \
+    --metadata-dim 64 \
+    --dropout 0.1 \
+    --limit-train-batches 2 \
+    --limit-eval-batches 2 \
+    --gpu "$TRAIN_GPU" \
+    --seed "$SEED"
 }
 
 fs1000_times() {
@@ -183,6 +280,11 @@ case "${1:-}" in
   build-corpus) build_corpus ;;
   audit-retrieval) audit_retrieval ;;
   candidates) precompute_candidates ;;
+  semantic-split) semantic_split ;;
+  semantic-smoke) semantic_smoke ;;
+  train-semantic) train_semantic ;;
+  semantic-val) evaluate_semantic val ;;
+  semantic-test) evaluate_semantic test ;;
   preprocess-all)
     fs1000_times
     finefs_features

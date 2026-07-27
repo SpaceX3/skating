@@ -14,6 +14,7 @@ from dataset.dataset_fs800 import (
     av_collate_fn_with_static,
 )
 from model import scoring_head
+from semantic_rag import FineFSSemanticRAG
 
 
 def parse_args():
@@ -95,6 +96,18 @@ def main():
         corpus["metadata_version"],
     ):
         raise ValueError("checkpoint and corpus metadata versions differ")
+    semantic_model = None
+    if use_rag:
+        semantic_model = FineFSSemanticRAG(
+            coarse_classes=len(corpus["coarse_class_vocab"]),
+            elements=len(corpus["element_vocab"]),
+            query_dim=corpus["keys"].shape[1],
+            evidence_dim=int(config.get("semantic_evidence_dim", 256)),
+            encoder_hidden_dim=int(config.get("semantic_encoder_hidden_dim", 512)),
+            metadata_dim=int(config.get("semantic_metadata_dim", 64)),
+            temperature=float(config.get("semantic_temperature", 0.07)),
+            dropout=float(config.get("semantic_dropout", 0.1)),
+        )
     model = scoring_head(
         depth=2,
         input_dim=768,
@@ -111,7 +124,9 @@ def main():
                 state_dict["static_proj.weight"].shape[0],
             )
         ),
+        baseline_head_type=str(config.get("baseline_head_type", "metric")),
         rag_corpus=corpus,
+        rag_semantic_model=semantic_model,
         rag_delta_max=float(config.get("rag_delta_max", 20.0)),
     ).to(device)
     if args.force_baseline_only and stage == "rag":

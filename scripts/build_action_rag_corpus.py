@@ -78,6 +78,8 @@ def trimmed_judge_grade(element):
     if not isinstance(scores, list) or len(scores) < 3:
         return float("nan")
     values = sorted(float(score) for score in scores)
+    if any(not np.isfinite(value) or value < -5.0 or value > 5.0 for value in values):
+        return float("nan")
     return float(np.mean(values[1:-1]))
 
 
