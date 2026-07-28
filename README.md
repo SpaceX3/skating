@@ -66,6 +66,10 @@ bash scripts/run_action_rag.sh test
 bash scripts/run_action_rag.sh preprocess-all
 bash scripts/run_action_rag.sh train-dynamic
 
+# Uses the current dynamic checkpoint by default.
+bash scripts/run_action_rag.sh train-rag
+
+# Override it when training against another baseline.
 DYNAMIC_CHECKPOINT=/absolute/path/to/dynamic_best.pth \
   bash scripts/run_action_rag.sh train-rag
 
@@ -75,6 +79,11 @@ CHECKPOINT=/absolute/path/to/rag_best.pth \
 CHECKPOINT=/absolute/path/to/rag_best.pth \
   bash scripts/run_action_rag.sh evaluate-dynamic
 ```
+
+RAG training reconstructs the frozen baseline layout from the selected dynamic
+checkpoint (including the static projection width and metric/legacy scoring
+head). This lets the current `legacy-womean` 128-dimensional dynamic checkpoint
+load exactly; explicit baseline-layout options, if supplied, must match it.
 
 Best checkpoints are selected by validation Spearman and named with epoch,
 validation loss and Spearman. The script-generated run name already contains

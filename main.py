@@ -18,6 +18,11 @@ from model import scoring_head
 from semantic_rag import FineFSSemanticRAG
 
 
+DEFAULT_BASELINE_STATIC_PROJ_DIM = 512
+DEFAULT_BASELINE_HEAD_TYPE = "metric"
+BASELINE_HEAD_TYPES = ("metric", "legacy-womean")
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--training-stage", choices=["dynamic", "rag"], required=True)
@@ -46,11 +51,23 @@ def parse_args():
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--rag-feature-dim", type=int, default=256)
-    parser.add_argument("--baseline-static-proj-dim", type=int, default=512)
+    parser.add_argument(
+        "--baseline-static-proj-dim",
+        type=int,
+        default=None,
+        help=(
+            "Baseline static projection width. During RAG training the value "
+            "is inferred from --dynamic-checkpoint unless supplied explicitly."
+        ),
+    )
     parser.add_argument(
         "--baseline-head-type",
-        choices=["metric", "legacy-womean"],
-        default="metric",
+        choices=BASELINE_HEAD_TYPES,
+        default=None,
+        help=(
+            "Baseline scoring-head layout. During RAG training the value is "
+            "inferred from --dynamic-checkpoint unless supplied explicitly."
+        ),
     )
     parser.add_argument("--rag-delta-max", type=float, default=20.0)
     parser.add_argument("--delta-l2-weight", type=float, default=1e-4)
@@ -77,15 +94,166 @@ def checkpoint_state_dict(path, device):
     return checkpoint, {}
 
 
-def load_checkpoint(
-    model, path, device, strict, allowed_missing_prefixes=()
+def strip_module_prefix(state_dict):
+    if not isinstance(state_dict, dict):
+        raise TypeError("checkpoint state_dict must be a mapping")
+    return {
+        (key[7:] if key.startswith("module.") else key): value
+        for key, value in state_dict.items()
+    }
+
+
+def checkpoint_baseline_architecture(state_dict, metadata=None):
+    """Read the baseline layout saved by a dynamic or legacy checkpoint.
+
+    Checkpoint metadata is preferred, while tensor shapes keep raw legacy
+    checkpoints usable and validate that metadata has not become stale.
+    """
+    state_dict = strip_module_prefix(state_dict)
+    metadata = metadata if isinstance(metadata, dict) else {}
+    config = metadata.get("config", {})
+    config = config if isinstance(config, dict) else {}
+
+    config_static_dim = config.get("baseline_static_proj_dim")
+    if config_static_dim is not None:
+        try:
+            config_static_dim = int(config_static_dim)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "checkpoint baseline_static_proj_dim must be an integer"
+            ) from error
+        if config_static_dim <= 0:
+            raise ValueError(
+                "checkpoint baseline_static_proj_dim must be positive"
+            )
+
+    state_static_dim = None
+    static_weight = state_dict.get("static_proj.weight")
+    if static_weight is not None:
+        if static_weight.ndim != 2:
+            raise ValueError("checkpoint static_proj.weight must be rank 2")
+        state_static_dim = int(static_weight.shape[0])
+
+    if (
+        config_static_dim is not None
+        and state_static_dim is not None
+        and config_static_dim != state_static_dim
+    ):
+        raise ValueError(
+            "checkpoint baseline_static_proj_dim conflicts with "
+            "static_proj.weight: {} != {}".format(
+                config_static_dim, state_static_dim
+            )
+        )
+
+    config_head_type = config.get("baseline_head_type")
+    if config_head_type is not None:
+        config_head_type = str(config_head_type)
+        if config_head_type not in BASELINE_HEAD_TYPES:
+            raise ValueError(
+                "unsupported checkpoint baseline_head_type: {}".format(
+                    config_head_type
+                )
+            )
+
+    state_head_type = None
+    first_head_weight = state_dict.get("time_score_mlp.0.weight")
+    if first_head_weight is not None:
+        if first_head_weight.ndim == 1:
+            # LayerNorm is the first module in the metric head.
+            state_head_type = "metric"
+        elif (
+            first_head_weight.ndim == 2
+            and "time_score_mlp.2.weight" in state_dict
+        ):
+            state_head_type = "legacy-womean"
+        else:
+            raise ValueError(
+                "cannot infer the baseline head layout from "
+                "time_score_mlp checkpoint tensors"
+            )
+
+    if (
+        config_head_type is not None
+        and state_head_type is not None
+        and config_head_type != state_head_type
+    ):
+        raise ValueError(
+            "checkpoint baseline_head_type conflicts with time_score_mlp "
+            "tensors: {} != {}".format(config_head_type, state_head_type)
+        )
+
+    return {
+        "baseline_static_proj_dim": (
+            config_static_dim
+            if config_static_dim is not None
+            else state_static_dim
+        ),
+        "baseline_head_type": (
+            config_head_type if config_head_type is not None else state_head_type
+        ),
+    }
+
+
+def resolve_baseline_architecture(
+    args, checkpoint_state=None, checkpoint_metadata=None, checkpoint_path=None
 ):
-    state_dict, metadata = checkpoint_state_dict(path, device)
-    if any(key.startswith("module.") for key in state_dict):
-        state_dict = {
-            (key[7:] if key.startswith("module.") else key): value
-            for key, value in state_dict.items()
-        }
+    """Resolve baseline construction arguments and reject incompatible overrides."""
+    checkpoint_layout = checkpoint_baseline_architecture(
+        checkpoint_state, checkpoint_metadata
+    ) if checkpoint_state is not None else {}
+
+    defaults = {
+        "baseline_static_proj_dim": DEFAULT_BASELINE_STATIC_PROJ_DIM,
+        "baseline_head_type": DEFAULT_BASELINE_HEAD_TYPE,
+    }
+    resolved = {}
+    for field, default in defaults.items():
+        requested = getattr(args, field)
+        saved = checkpoint_layout.get(field)
+        if requested is not None and saved is not None and requested != saved:
+            raise ValueError(
+                "{}={} is incompatible with checkpoint {} ({}={}). "
+                "RAG training must preserve the frozen baseline architecture.".format(
+                    field,
+                    requested,
+                    checkpoint_path or "<provided checkpoint>",
+                    field,
+                    saved,
+                )
+            )
+        resolved[field] = requested if requested is not None else (saved or default)
+        setattr(args, field, resolved[field])
+
+    if args.baseline_static_proj_dim <= 0:
+        raise ValueError("--baseline-static-proj-dim must be positive")
+    if args.baseline_head_type not in BASELINE_HEAD_TYPES:
+        raise ValueError("unknown baseline_head_type: {}".format(args.baseline_head_type))
+
+    source = checkpoint_path if checkpoint_path else "default settings"
+    print(
+        "baseline architecture: static_proj_dim={}, head_type={} ({})".format(
+            args.baseline_static_proj_dim,
+            args.baseline_head_type,
+            source,
+        )
+    )
+    return resolved
+
+
+def load_checkpoint(
+    model,
+    path,
+    device,
+    strict,
+    allowed_missing_prefixes=(),
+    state_dict=None,
+    metadata=None,
+):
+    if state_dict is None:
+        state_dict, metadata = checkpoint_state_dict(path, device)
+    state_dict = strip_module_prefix(state_dict)
+    metadata = {} if metadata is None else metadata
     if strict:
         model.load_state_dict(state_dict, strict=True)
         print("loaded checkpoint strictly:", path)
@@ -98,13 +266,21 @@ def load_checkpoint(
         }
         result = model.load_state_dict(compatible, strict=False)
         ignored = sorted(set(state_dict).difference(compatible))
+        allowed_missing = [
+            key
+            for key in result.missing_keys
+            if key.startswith(tuple(allowed_missing_prefixes))
+        ]
         invalid_missing = [
             key
             for key in result.missing_keys
             if not key.startswith(tuple(allowed_missing_prefixes))
         ]
         print("loaded compatible tensors:", len(compatible), "from", path)
-        print("missing keys:", result.missing_keys)
+        if allowed_missing:
+            print("initialized new checkpoint keys:", len(allowed_missing))
+        if invalid_missing:
+            print("missing keys:", invalid_missing)
         print("ignored checkpoint keys:", ignored)
         if ignored or invalid_missing:
             raise RuntimeError(
@@ -136,6 +312,22 @@ def configure_trainable(model, stage):
 def build_model(args, device):
     corpus = None
     use_rag = args.training_stage == "rag"
+    checkpoint_path = args.dynamic_checkpoint if use_rag else args.init_checkpoint
+    checkpoint_state = None
+    checkpoint_metadata = None
+    if use_rag and not checkpoint_path:
+        raise ValueError("--dynamic-checkpoint is required for the rag stage")
+    if checkpoint_path:
+        checkpoint_state, checkpoint_metadata = checkpoint_state_dict(
+            checkpoint_path, device
+        )
+    resolve_baseline_architecture(
+        args,
+        checkpoint_state=checkpoint_state,
+        checkpoint_metadata=checkpoint_metadata,
+        checkpoint_path=checkpoint_path,
+    )
+
     if use_rag:
         corpus = load_action_corpus(args.rag_corpus_path)
         if not args.semantic_checkpoint:
@@ -180,19 +372,26 @@ def build_model(args, device):
         rag_delta_max=args.rag_delta_max,
     ).to(device)
     if use_rag:
-        if not args.dynamic_checkpoint:
-            raise ValueError("--dynamic-checkpoint is required for the rag stage")
         metadata = load_checkpoint(
             model,
             args.dynamic_checkpoint,
             device=device,
             strict=False,
             allowed_missing_prefixes=("rag.",),
+            state_dict=checkpoint_state,
+            metadata=checkpoint_metadata,
         )
         if metadata.get("training_stage") not in (None, "dynamic"):
             raise ValueError("RAG must start from a dynamic-stage checkpoint")
     elif args.init_checkpoint:
-        load_checkpoint(model, args.init_checkpoint, device=device, strict=False)
+        load_checkpoint(
+            model,
+            args.init_checkpoint,
+            device=device,
+            strict=False,
+            state_dict=checkpoint_state,
+            metadata=checkpoint_metadata,
+        )
     configure_trainable(model, args.training_stage)
     return model, corpus
 

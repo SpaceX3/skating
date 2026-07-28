@@ -20,6 +20,7 @@ RESULTS="${RESULTS:-$PROJECT_ROOT/rag_results}"
 SEMANTIC_SPLIT="${SEMANTIC_SPLIT:-$PROJECT_ROOT/rag_artifacts/finefs_semantic_split.json}"
 SEMANTIC_RESULTS="${SEMANTIC_RESULTS:-$RESULTS/semantic}"
 INIT_CHECKPOINT="${INIT_CHECKPOINT:-$PROJECT_ROOT/fs800_result/checkpoint_epoch42_loss112.53_spear0.879.pth}"
+DYNAMIC_CHECKPOINT="${DYNAMIC_CHECKPOINT:-$PROJECT_ROOT/rag_results/dynamic/dynamic_seed2026_20260724_004400_best_epoch080_loss83.0444_spear0.8658.pth}"
 
 cd "$PROJECT_ROOT"
 export PYTHONPATH="$PROJECT_ROOT${PYTHONPATH:+:$PYTHONPATH}"
@@ -40,7 +41,7 @@ Usage:
   SEMANTIC_CHECKPOINT=/path/to/semantic_best.pth bash scripts/run_action_rag.sh semantic-val
   SEMANTIC_CHECKPOINT=/path/to/semantic_best.pth bash scripts/run_action_rag.sh semantic-test
   bash scripts/run_action_rag.sh train-dynamic
-  DYNAMIC_CHECKPOINT=/path/to/dynamic_best.pth bash scripts/run_action_rag.sh train-rag
+  bash scripts/run_action_rag.sh train-rag
   CHECKPOINT=/path/to/checkpoint.pth bash scripts/run_action_rag.sh evaluate
   CHECKPOINT=/path/to/rag_checkpoint.pth bash scripts/run_action_rag.sh evaluate-baseline
 
@@ -48,7 +49,7 @@ Optional environment variables:
   PREPROCESS_GPU=0 TRAIN_GPU=1 NUM_WORKERS=8 SEED=2026 TOP_K=8
   SEMANTIC_BATCH_SIZE=512 SEMANTIC_NUM_WORKERS=0
   INIT_CHECKPOINT=/path/to/legacy_checkpoint.pth
-  DYNAMIC_CHECKPOINT=/path/to/dynamic_best.pth
+  DYNAMIC_CHECKPOINT=/path/to/dynamic_best.pth  # optional override for train-rag
   CHECKPOINT=/path/to/evaluation_checkpoint.pth
   SEMANTIC_CHECKPOINT=/path/to/finefs_semantic_best.pth
 EOF
@@ -225,7 +226,10 @@ train_dynamic() {
 }
 
 train_rag() {
-  : "${DYNAMIC_CHECKPOINT:?Set DYNAMIC_CHECKPOINT to the dynamic-stage best checkpoint}"
+  if [[ ! -f "$DYNAMIC_CHECKPOINT" ]]; then
+    echo "Dynamic checkpoint not found: $DYNAMIC_CHECKPOINT" >&2
+    return 2
+  fi
   local run_name="rag_seed${SEED}_$(date +%Y%m%d_%H%M%S)"
   mkdir -p "$RESULTS/rag"
   "$ACTION_PY" main.py \
