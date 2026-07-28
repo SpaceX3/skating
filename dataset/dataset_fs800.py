@@ -1,5 +1,6 @@
 import torch
 import torch.utils.data as data
+from semantic_rag import require_candidate_v2
 import os
 import numpy as np
 from torch.nn.utils.rnn import pad_sequence
@@ -168,6 +169,10 @@ class FeatureDatasetWithStaticCache(data.Dataset):
                     raise FileNotFoundError(f"Missing RAG candidates: {candidate_path}")
             else:
                 with np.load(candidate_path, allow_pickle=False) as payload:
+                    try:
+                        require_candidate_v2(payload)
+                    except ValueError as error:
+                        raise ValueError("{} in {}".format(error, candidate_path))
                     candidate_indices = payload["candidate_indices"].astype(np.int64)
                     candidate_similarities = payload[
                         "candidate_similarities"

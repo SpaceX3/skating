@@ -10,7 +10,14 @@ from semantic_data import (
 )
 from semantic_main import deduplicated_indices, gather, prepare_device_corpus
 from scripts.build_action_rag_corpus import trimmed_judge_grade
-from semantic_rag import FineFSSemanticRAG, multi_positive_nll, soft_target_nll
+from semantic_rag import (
+    FineFSSemanticRAG,
+    SemanticQueryClassifier,
+    require_candidate_v2,
+    require_semantic_v2,
+    multi_positive_nll,
+    soft_target_nll,
+)
 
 
 def synthetic_semantic_corpus():
@@ -63,6 +70,54 @@ class MultiPositiveLossTest(unittest.TestCase):
 
 
 class FineFSSemanticRAGTest(unittest.TestCase):
+    def make_model(self):
+        return FineFSSemanticRAG(5, 5, 6, 8, 16, 4, dropout=0.0)
+
+    def test_classifier_inference_has_no_label_argument(self):
+        classifier = SemanticQueryClassifier(5, 5, 6, 8, 16, 0.0)
+        output = classifier.classify_query(torch.randn(2, 6))
+        self.assertEqual(output["element_probabilities"].shape, (2, 5))
+        with self.assertRaises(TypeError):
+            classifier.classify_query(torch.randn(2, 6), torch.tensor([1, 2]))
+
+    def test_soft_route_probability_is_monotonic_and_not_hard_top1(self):
+        model = self.make_model()
+        query_retrieval = torch.tensor([[1.0, 0.0, 0, 0, 0, 0, 0, 0]])
+        references = torch.tensor([[1.0, 0.0, 0, 0, 0, 0, 0, 0], [0.9, 0.1, 0, 0, 0, 0, 0, 0]])
+        references = torch.nn.functional.normalize(references, dim=-1)
+        coarse = torch.tensor([2, 2]); elements = torch.tensor([2, 3])
+        coarse_p = torch.tensor([[0.01, 0.01, 0.96, 0.01, 0.01]])
+        low = torch.tensor([[0.01, 0.01, 0.10, 0.86, 0.02]])
+        high = torch.tensor([[0.01, 0.01, 0.40, 0.56, 0.02]])
+        score_low = model.retrieval_scores(query_retrieval, torch.tensor([0.9]), coarse_p, low, references, coarse, elements)
+        score_high = model.retrieval_scores(query_retrieval, torch.tensor([0.9]), coarse_p, high, references, coarse, elements)
+        self.assertGreater(float(score_high[0, 0]), float(score_low[0, 0]))
+        self.assertTrue(torch.isfinite(score_low[0, 0]))  # element 2 is not top-1
+
+    def test_full_bank_and_per_query_scores_match(self):
+        model = self.make_model(); torch.manual_seed(8)
+        q = torch.nn.functional.normalize(torch.randn(2, 8), dim=-1)
+        r = torch.nn.functional.normalize(torch.randn(3, 8), dim=-1)
+        action = torch.tensor([0.8, 0.3]); coarse_p = torch.softmax(torch.randn(2, 5), -1); element_p = torch.softmax(torch.randn(2, 5), -1)
+        coarse = torch.tensor([1, 2, 3]); element = torch.tensor([1, 2, 3])
+        full = model.retrieval_scores(q, action, coarse_p, element_p, r, coarse, element)
+        per = model.retrieval_scores(q, action, coarse_p, element_p, r.unsqueeze(0).expand(2, -1, -1), coarse.unsqueeze(0).expand(2, -1), element.unsqueeze(0).expand(2, -1))
+        self.assertTrue(torch.allclose(full, per, atol=1e-6))
+
+    def test_goe_decomposition_invalid_mask_and_direct_fallback(self):
+        model = self.make_model()
+        output = model(torch.randn(1, 6), torch.randn(1, 2, 6), torch.tensor([[2, 3]]), torch.tensor([[2, 3]]), torch.tensor([[1.0, -1.0]]), torch.ones(1, 2), torch.ones(1, 2), torch.tensor([[False, False]]))
+        self.assertTrue(torch.equal(output["goe_evidence_weights"], torch.zeros_like(output["goe_evidence_weights"])))
+        self.assertTrue(torch.allclose(output["predicted_goe"], output["direct_goe"]))
+        self.assertTrue(torch.isfinite(output["predicted_goe"]).all())
+        self.assertTrue(torch.allclose(output["evidence_goe_unbounded"], output["evidence_reference_goe"] + output["evidence_delta_goe"]))
+
+    def test_v1_checkpoint_rejected_clearly(self):
+        with self.assertRaisesRegex(ValueError, "format_version.*v1 checkpoints"):
+            require_semantic_v2({"training_stage": "finefs_semantic"})
+        with self.assertRaisesRegex(ValueError, "v1 candidates"):
+            require_candidate_v2({"candidate_indices": []})
+
     def test_outputs_are_finite_and_goe_is_bounded(self):
         torch.manual_seed(4)
         model = FineFSSemanticRAG(

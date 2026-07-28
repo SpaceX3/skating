@@ -21,12 +21,27 @@ from semantic_data import (
     save_video_split,
     split_statistics,
 )
-from semantic_rag import FineFSSemanticRAG, multi_positive_nll, soft_target_nll
+from semantic_rag import (
+    CLASSIFIER_STAGE,
+    GOE_STAGE,
+    SEMANTIC_FORMAT_VERSION,
+    FineFSSemanticRAG,
+    SemanticQueryClassifier,
+    build_semantic_pipeline,
+    multi_positive_nll,
+    pipeline_from_checkpoint,
+    require_semantic_v2,
+    soft_target_nll,
+)
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["split", "train", "eval"], required=True)
+    parser.add_argument(
+        "--mode",
+        choices=["split", "train-classifier", "train-goe", "eval"],
+        required=True,
+    )
     parser.add_argument("--corpus", default="rag_artifacts/action_rag_corpus.pt")
     parser.add_argument(
         "--split-path", default="rag_artifacts/finefs_semantic_split.json"
@@ -36,6 +51,7 @@ def parse_args():
     parser.add_argument("--val-ratio", type=float, default=0.15)
     parser.add_argument("--eval-split", choices=["train", "val", "test"], default="val")
     parser.add_argument("--checkpoint", default=None)
+    parser.add_argument("--classifier-checkpoint", default=None)
     parser.add_argument("--output-dir", default="rag_results/semantic")
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--batch-size", type=int, default=64)
@@ -150,19 +166,13 @@ def model_from_args(args, corpus, device):
 
 
 def model_from_checkpoint(checkpoint, corpus, device):
-    config = checkpoint.get("config", {})
-    model = FineFSSemanticRAG(
-        coarse_classes=len(corpus["coarse_class_vocab"]),
-        elements=len(corpus["element_vocab"]),
-        query_dim=corpus["keys"].shape[1],
-        evidence_dim=int(config.get("evidence_dim", 256)),
-        encoder_hidden_dim=int(config.get("encoder_hidden_dim", 512)),
-        metadata_dim=int(config.get("metadata_dim", 64)),
-        temperature=float(config.get("temperature", 0.07)),
-        dropout=float(config.get("dropout", 0.1)),
-    ).to(device)
-    model.load_state_dict(checkpoint["state_dict"], strict=True)
-    return model
+    return pipeline_from_checkpoint(
+        checkpoint,
+        len(corpus["coarse_class_vocab"]),
+        len(corpus["element_vocab"]),
+        corpus["keys"].shape[1],
+        device,
+    )
 
 
 def prepare_device_corpus(corpus, device):
@@ -337,9 +347,6 @@ def semantic_losses(args, corpus, output, query, reference, positive_mask, candi
     total = (
         args.retrieval_loss_weight * retrieval_loss
         + args.citation_loss_weight * citation_loss
-        + args.action_loss_weight * action_loss
-        + args.coarse_loss_weight * coarse_loss
-        + args.element_loss_weight * element_loss
         + args.goe_loss_weight * goe_loss
         + args.direct_goe_loss_weight * direct_goe_loss
         + args.relative_goe_loss_weight * relative_loss
@@ -398,13 +405,9 @@ def mine_training_candidates(
                 device=device,
             )
             query = gather(device_corpus, query_batch)
-            query_token, query_embeddings = model.encode_query(query["features"])
-            element_logits = model.element_head(query_token)
-            similarities = model.retrieval_scores(
-                query_embeddings,
-                element_logits,
-                bank_embeddings,
-                bank_element,
+            _, similarities = full_bank_scores(
+                model, query["features"], bank_embeddings,
+                device_corpus["coarse"][bank_indices], bank_element,
             )
             cross_video = query["video"].unsqueeze(1).ne(bank_video.unsqueeze(0))
             same_element = query["element"].unsqueeze(1).eq(
@@ -515,16 +518,18 @@ def encode_reference_bank(model, device_corpus, reference_indices, batch_size):
         for start in range(0, len(reference_indices), batch_size):
             indices = torch.tensor(reference_indices[start : start + batch_size])
             reference = gather(device_corpus, indices)
-            _, normalized, _ = model.encode_reference(
-                reference["features"],
-                reference["coarse"],
-                reference["element"],
-                reference["goe"],
-                reference["bv"],
-                reference["panel"],
-            )
+            normalized = model.encode_reference_visual(reference["features"])
             embeddings.append(normalized)
     return torch.cat(embeddings, dim=0)
+
+
+def full_bank_scores(model, query_features, bank_embeddings, bank_coarse, bank_element):
+    predicted = model.classify_query(query_features)
+    return predicted, model.retrieval_scores(
+        predicted["query_retrieval"], predicted["action_probability"],
+        predicted["coarse_probabilities"], predicted["element_probabilities"],
+        bank_embeddings, bank_coarse, bank_element,
+    )
 
 
 def deduplicated_indices(top_indices, bank_indices, bank_instance_ids, top_k):
@@ -658,12 +663,9 @@ def evaluate(args, model, corpus, manifest, split_name, device, device_corpus=No
             if args.limit_eval_batches is not None and batch_index >= args.limit_eval_batches:
                 break
             query = gather(device_corpus, query_indices)
-            query_token, query_embeddings = model.encode_query(query["features"])
-            element_logits = model.element_head(query_token)
-            similarities = model.retrieval_scores(
-                query_embeddings,
-                element_logits,
-                bank_embeddings,
+            _, similarities = full_bank_scores(
+                model, query["features"], bank_embeddings,
+                device_corpus["coarse"][bank_indices],
                 device_corpus["element"][bank_indices],
             )
             if split_name == "train":
@@ -814,17 +816,166 @@ def evaluate(args, model, corpus, manifest, split_name, device, device_corpus=No
     }
 
 
+def classifier_metrics(model, loader, device_corpus, corpus, args):
+    model.eval()
+    background = list(corpus["coarse_class_vocab"]).index("background")
+    truth_action, pred_action, truth_coarse, pred_coarse = [], [], [], []
+    truth_element, top_elements, weights, entropies, confidences = [], [], [], [], []
+    with torch.no_grad():
+        for batch_index, indices in enumerate(loader):
+            if args.limit_eval_batches is not None and batch_index >= args.limit_eval_batches:
+                break
+            batch = gather(device_corpus, indices)
+            output = model.classify_query(batch["features"])
+            action = batch["coarse"].ne(background)
+            truth_action.extend(action.cpu().tolist())
+            pred_action.extend(output["action_probability"].ge(0.5).cpu().tolist())
+            mask = action
+            if mask.any():
+                truth_coarse.extend(batch["coarse"][mask].cpu().tolist())
+                pred_coarse.extend(output["coarse_logits"][mask].argmax(-1).cpu().tolist())
+                truth_element.extend(batch["element"][mask].cpu().tolist())
+                top_elements.extend(output["element_logits"][mask].topk(min(10, model.elements), -1).indices.cpu().tolist())
+                weights.extend(batch["sample_weight"][mask].cpu().tolist())
+                probability = output["element_probabilities"][mask]
+                entropies.extend((-(probability.clamp_min(1e-12).log() * probability).sum(-1)).cpu().tolist())
+                confidences.extend(probability.max(-1).values.cpu().tolist())
+    action_truth = np.asarray(truth_action, dtype=bool)
+    action_pred = np.asarray(pred_action, dtype=bool)
+    tp = float(np.sum(action_truth & action_pred)); tn = float(np.sum(~action_truth & ~action_pred))
+    fp = float(np.sum(~action_truth & action_pred)); fn = float(np.sum(action_truth & ~action_pred))
+    recall = tp / max(tp + fn, 1.0); precision = tp / max(tp + fp, 1.0)
+    action_balanced = 0.5 * (recall + tn / max(tn + fp, 1.0))
+    w = np.asarray(weights, dtype=np.float64)
+    target = np.asarray(truth_element)
+    top = np.asarray(top_elements)
+    def coverage(k):
+        return float(np.average((top[:, :min(k, top.shape[1])] == target[:, None]).any(1), weights=w)) if len(target) else 0.0
+    element_to_coarse = element_coarse_mapping(corpus)
+    hierarchy_consistent = np.asarray(pred_coarse) == np.asarray([element_to_coarse[int(value)] for value in top[:, 0]])
+    per_coarse = {}
+    coarse_names = corpus["coarse_class_vocab"]
+    for coarse_id in sorted(set(truth_coarse)):
+        rows = np.asarray(truth_coarse) == coarse_id
+        per_coarse[coarse_names[coarse_id]] = {
+            "count": int(rows.sum()),
+            "element_top1": float(np.average(top[rows, 0] == target[rows], weights=w[rows])),
+            "element_top5": float(np.average((top[rows, :min(5, top.shape[1])] == target[rows, None]).any(1), weights=w[rows])),
+        }
+    return {
+        "action_accuracy": float(np.mean(action_truth == action_pred)),
+        "action_balanced_accuracy": action_balanced,
+        "action_precision": precision, "action_recall": recall,
+        "action_f1": 2 * precision * recall / max(precision + recall, 1e-12),
+        "coarse_top1": float(np.mean(np.asarray(truth_coarse) == np.asarray(pred_coarse))),
+        "element_top1": coverage(1), "element_top5": coverage(5), "element_top10": coverage(10),
+        "hierarchy_consistency": float(np.mean(hierarchy_consistent)),
+        "element_per_coarse": per_coarse,
+        "element_entropy_mean": float(np.mean(entropies)),
+        "element_confidence_mean": float(np.mean(confidences)),
+    }
+
+
+def element_coarse_mapping(corpus):
+    counts = defaultdict(lambda: defaultdict(int))
+    seen = set()
+    for instance, element, coarse in zip(corpus["instance_ids"], corpus["element_ids"], corpus["coarse_class_ids"]):
+        key = (str(instance), int(element), int(coarse))
+        if key in seen: continue
+        seen.add(key); counts[int(element)][int(coarse)] += 1
+    return [
+        max(counts[element], key=counts[element].get) if counts[element] else 0
+        for element in range(len(corpus["element_vocab"]))
+    ]
+
+
+def save_classifier_checkpoint(path, model, optimizer, args, corpus, manifest, epoch, validation):
+    torch.save({
+        "format_version": SEMANTIC_FORMAT_VERSION,
+        "training_stage": CLASSIFIER_STAGE,
+        "classifier_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(), "epoch": epoch,
+        "validation": validation, "config": vars(args),
+        "coarse_class_vocab": list(corpus["coarse_class_vocab"]),
+        "element_vocab": list(corpus["element_vocab"]),
+        "element_to_coarse": element_coarse_mapping(corpus),
+        "corpus_version": corpus["metadata_version"],
+        "split_format_version": manifest["format_version"],
+    }, path)
+
+
+def train_classifier(args, corpus, manifest, device):
+    model = SemanticQueryClassifier(
+        len(corpus["coarse_class_vocab"]), len(corpus["element_vocab"]),
+        corpus["keys"].shape[1], args.evidence_dim, args.encoder_hidden_dim, args.dropout,
+    ).to(device)
+    device_corpus = prepare_device_corpus(corpus, device)
+    train_dataset = FineFSSemanticDataset(corpus, manifest["splits"]["train"])
+    val_dataset = FineFSSemanticDataset(corpus, manifest["splits"]["val"])
+    train_loader = data.DataLoader(train_dataset, args.batch_size, shuffle=True, num_workers=args.num_workers)
+    val_loader = data.DataLoader(val_dataset, args.batch_size, shuffle=False, num_workers=args.num_workers)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.step_size, gamma=args.gamma)
+    background = list(corpus["coarse_class_vocab"]).index("background")
+    background_element = list(corpus["element_vocab"]).index("<background>")
+    train_set = set(manifest["splits"]["train"]); element_counts = torch.ones(model.elements, device=device)
+    seen_instances = set()
+    for i, video in enumerate(corpus["video_ids"]):
+        instance = str(corpus["instance_ids"][i])
+        if str(video) not in train_set or instance in seen_instances: continue
+        seen_instances.add(instance); element_counts[int(corpus["element_ids"][i])] += 1
+    element_class_weights = (element_counts.mean() / element_counts).sqrt().clamp(max=10.0)
+    os.makedirs(args.output_dir, exist_ok=True)
+    run_name = args.run_name or "semantic_classifier_seed{}_{}".format(args.seed, datetime.now().strftime("%Y%m%d_%H%M%S"))
+    best = (-float("inf"), -float("inf")); best_path = None
+    for epoch in range(args.epochs):
+        model.train(); totals = defaultdict(float); samples = 0
+        for batch_index, indices in enumerate(train_loader):
+            if args.limit_train_batches is not None and batch_index >= args.limit_train_batches: break
+            batch = gather(device_corpus, indices); output = model(batch["features"])
+            is_action = batch["coarse"].ne(background); weight = batch["sample_weight"]
+            action_each = F.binary_cross_entropy_with_logits(output["action_logit"], is_action.float(), reduction="none")
+            action_mass = torch.stack([weight[~is_action].sum(), weight[is_action].sum()]).clamp_min(1e-12)
+            action_class_weight = weight.sum() / (2.0 * action_mass)
+            action_loss = weighted_mean(action_each, weight * action_class_weight[is_action.long()])
+            coarse_each = F.cross_entropy(output["coarse_logits"], batch["coarse"], reduction="none")
+            coarse_loss = weighted_mean(coarse_each, weight, is_action)
+            valid_element = is_action & batch["element"].ne(background_element)
+            element_each = F.cross_entropy(output["element_logits"], batch["element"], weight=element_class_weights, reduction="none")
+            element_loss = weighted_mean(element_each, weight, valid_element)
+            total = args.action_loss_weight * action_loss + args.coarse_loss_weight * coarse_loss + args.element_loss_weight * element_loss
+            optimizer.zero_grad(set_to_none=True); total.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0); optimizer.step()
+            n = len(indices); samples += n
+            for name, value in (("total", total), ("action", action_loss), ("coarse", coarse_loss), ("element", element_loss)): totals[name] += float(value.detach()) * n
+        validation = classifier_metrics(model, val_loader, device_corpus, corpus, args)
+        record = {"epoch": epoch + 1, "train": {k: v/max(samples, 1) for k,v in totals.items()}, "validation": validation}
+        print(json.dumps(record, ensure_ascii=False))
+        score = (validation["element_top10"], validation["element_top1"])
+        if score > best:
+            best = score
+            best_path = os.path.join(args.output_dir, "{}_best_epoch{:03d}_top10{:.4f}_top1{:.4f}.pth".format(run_name, epoch+1, *score))
+            save_classifier_checkpoint(best_path, model, optimizer, args, corpus, manifest, epoch, validation)
+            print("saved best classifier:", best_path)
+        scheduler.step()
+    print("best classifier checkpoint:", best_path)
+
+
 def save_checkpoint(path, model, optimizer, args, corpus, manifest, epoch, validation):
     torch.save(
         {
-            "state_dict": model.state_dict(),
+            "format_version": SEMANTIC_FORMAT_VERSION,
+            "classifier_state_dict": model.classifier.state_dict(),
+            "goe_state_dict": model.goe_model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
-            "training_stage": "finefs_semantic",
+            "training_stage": GOE_STAGE,
             "epoch": epoch,
             "validation": validation,
             "config": vars(args),
             "corpus_version": corpus["metadata_version"],
             "split_format_version": manifest["format_version"],
+            "coarse_class_vocab": list(corpus["coarse_class_vocab"]),
+            "element_vocab": list(corpus["element_vocab"]),
+            "element_to_coarse": element_coarse_mapping(corpus),
         },
         path,
     )
@@ -840,8 +991,26 @@ def selection_value(validation, name):
     raise ValueError("unsupported selection metric: {}".format(name))
 
 
-def train(args, corpus, manifest, device):
-    model = model_from_args(args, corpus, device)
+def train_goe(args, corpus, manifest, device):
+    if not args.classifier_checkpoint:
+        raise ValueError("--classifier-checkpoint is required for --mode train-goe")
+    classifier_checkpoint = torch.load(args.classifier_checkpoint, map_location=device)
+    require_semantic_v2(classifier_checkpoint, CLASSIFIER_STAGE)
+    if classifier_checkpoint.get("corpus_version") != corpus["metadata_version"]:
+        raise ValueError("classifier checkpoint and action corpus versions differ")
+    config = dict(classifier_checkpoint.get("config", {}))
+    args.evidence_dim = int(config.get("evidence_dim", args.evidence_dim))
+    args.encoder_hidden_dim = int(config.get("encoder_hidden_dim", args.encoder_hidden_dim))
+    config.update({
+        "metadata_dim": args.metadata_dim, "temperature": args.temperature,
+        "dropout": args.dropout,
+    })
+    model = build_semantic_pipeline(
+        config, len(corpus["coarse_class_vocab"]), len(corpus["element_vocab"]),
+        corpus["keys"].shape[1],
+    ).to(device)
+    model.classifier.load_state_dict(classifier_checkpoint["classifier_state_dict"], strict=True)
+    model.freeze_classifier()
     model.set_element_goe_prior(
         element_goe_priors(corpus, manifest["splits"]["train"])
     )
@@ -857,7 +1026,7 @@ def train(args, corpus, manifest, device):
     )
     reference_indices = list(dataset.indices)
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=args.lr, weight_decay=args.weight_decay
+        model.goe_model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
     scheduler = torch.optim.lr_scheduler.StepLR(
         optimizer, step_size=args.step_size, gamma=args.gamma
@@ -992,14 +1161,16 @@ def main():
     device = torch.device(
         "cpu" if args.cpu or not torch.cuda.is_available() else "cuda:{}".format(args.gpu)
     )
-    if args.mode == "train":
-        train(args, corpus, manifest, device)
+    if args.mode == "train-classifier":
+        train_classifier(args, corpus, manifest, device)
+        return
+    if args.mode == "train-goe":
+        train_goe(args, corpus, manifest, device)
         return
     if not args.checkpoint:
         raise ValueError("--checkpoint is required for semantic evaluation")
     checkpoint = torch.load(args.checkpoint, map_location=device)
-    if checkpoint.get("training_stage") != "finefs_semantic":
-        raise ValueError("checkpoint is not a FineFS semantic checkpoint")
+    require_semantic_v2(checkpoint, GOE_STAGE)
     if checkpoint.get("corpus_version") != corpus["metadata_version"]:
         raise ValueError("checkpoint and action corpus versions differ")
     model = model_from_checkpoint(checkpoint, corpus, device)

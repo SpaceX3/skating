@@ -27,8 +27,9 @@ TimeSformer + AST + bidirectional MRU
     -> masked global pooling -> TES_dynamic
 
 FS1000 DINO query
-    -> fixed cosine Top-K retrieval from a FineFS action corpus
-    -> query/reference pair encoder with GOE, BV and panel-score evidence
+    -> frozen action/coarse/exact-element classifier
+    -> visual + predicted-distribution soft routing over FineFS-train
+    -> reference-relative delta-GOE and confidence-controlled evidence
     -> evidence-only video aggregation -> Delta_TES_RAG
 
 TES_final = TES_dynamic + Delta_TES_RAG
@@ -105,11 +106,19 @@ test videos never enter the bank.
 # Create the deterministic 70/15/15 video split once.
 bash scripts/run_action_rag.sh semantic-split
 
-# Short real-corpus check before a full run.
+# Short classifier real-corpus check before a full run.
 TRAIN_GPU=0 bash scripts/run_action_rag.sh semantic-smoke
 
-# Full semantic training.
-TRAIN_GPU=0 bash scripts/run_action_rag.sh train-semantic
+# Stage A: train query classification without GOE gradients.
+TRAIN_GPU=0 bash scripts/run_action_rag.sh train-semantic-classifier
+
+# Stage B: freeze that classifier and train soft retrieval / GOE.
+CLASSIFIER_CHECKPOINT=/absolute/path/to/classifier_v2.pth TRAIN_GPU=0 \
+  bash scripts/run_action_rag.sh train-semantic-goe
+
+# Generate versioned FS1000 candidates from the FineFS-train bank only.
+SEMANTIC_CHECKPOINT=/absolute/path/to/goe_v2.pth \
+  bash scripts/run_action_rag.sh candidates-v2
 
 # Validation and held-out FineFS test evaluation.
 SEMANTIC_CHECKPOINT=/absolute/path/to/semantic_best.pth TRAIN_GPU=0 \
@@ -118,10 +127,12 @@ SEMANTIC_CHECKPOINT=/absolute/path/to/semantic_best.pth TRAIN_GPU=0 \
   bash scripts/run_action_rag.sh semantic-test
 ```
 
-The semantic checkpoint is independent of previous RAG checkpoints. It uses a
-2048 -> 512 -> 256 DINO query encoder and stores the full retrieval/citation/GOE
-model for a newly trained TES stage. FineFS test labels are used only for final
-semantic metrics.
+The GOE checkpoint is self-contained: it stores the frozen classifier and GOE
+state dictionaries, vocabularies, corpus version and `finefs-semantic-v2`
+format marker. Old semantic checkpoints and candidate files are rejected; v2
+candidates live in `rag_artifacts/candidates_v2`. RAG receives expected element
+and coarse embeddings plus direct, reference, delta and fused GOE values.
+FineFS test labels are used only for final semantic metrics.
 
 `preprocess-all` is intentionally separate from training because FineFS DINO
 feature extraction covers 1167 long videos and can take several hours. The

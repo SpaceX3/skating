@@ -14,7 +14,7 @@ from dataset.dataset_fs800 import (
     av_collate_fn_with_static,
 )
 from model import scoring_head
-from semantic_rag import FineFSSemanticRAG
+from semantic_rag import pipeline_from_checkpoint, require_semantic_v2, GOE_STAGE
 
 
 def parse_args():
@@ -22,7 +22,7 @@ def parse_args():
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--root-path", default="../FS1000 Dataset")
     parser.add_argument("--rag-corpus-path", default="rag_artifacts/action_rag_corpus.pt")
-    parser.add_argument("--candidate-dir", default="rag_artifacts/candidates")
+    parser.add_argument("--candidate-dir", default="rag_artifacts/candidates_v2")
     parser.add_argument(
         "--static-cache-dir-name", default="static_dinov2_cls_patch_mean_cache"
     )
@@ -98,15 +98,14 @@ def main():
         raise ValueError("checkpoint and corpus metadata versions differ")
     semantic_model = None
     if use_rag:
-        semantic_model = FineFSSemanticRAG(
-            coarse_classes=len(corpus["coarse_class_vocab"]),
-            elements=len(corpus["element_vocab"]),
-            query_dim=corpus["keys"].shape[1],
-            evidence_dim=int(config.get("semantic_evidence_dim", 256)),
-            encoder_hidden_dim=int(config.get("semantic_encoder_hidden_dim", 512)),
-            metadata_dim=int(config.get("semantic_metadata_dim", 64)),
-            temperature=float(config.get("semantic_temperature", 0.07)),
-            dropout=float(config.get("semantic_dropout", 0.1)),
+        semantic_checkpoint_path = config.get("semantic_checkpoint")
+        if not semantic_checkpoint_path:
+            raise ValueError("v2 RAG checkpoint config is missing semantic_checkpoint")
+        semantic_checkpoint = torch.load(semantic_checkpoint_path, map_location=device)
+        require_semantic_v2(semantic_checkpoint, GOE_STAGE)
+        semantic_model = pipeline_from_checkpoint(
+            semantic_checkpoint, len(corpus["coarse_class_vocab"]),
+            len(corpus["element_vocab"]), corpus["keys"].shape[1], device,
         )
     model = scoring_head(
         depth=2,

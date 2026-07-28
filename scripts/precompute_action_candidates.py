@@ -1,5 +1,6 @@
 import argparse
 import glob
+import hashlib
 import json
 import os
 import sys
@@ -12,7 +13,11 @@ import torch.nn.functional as F
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from action_rag import load_action_corpus
-from semantic_rag import FineFSSemanticRAG
+from semantic_data import load_video_split
+from semantic_rag import (
+    SEMANTIC_FORMAT_VERSION,
+    pipeline_from_checkpoint,
+)
 
 
 def rounded(values):
@@ -118,7 +123,8 @@ def main():
     )
     parser.add_argument("--corpus", default="rag_artifacts/action_rag_corpus.pt")
     parser.add_argument("--semantic-checkpoint", required=True)
-    parser.add_argument("--output-dir", default="rag_artifacts/candidates")
+    parser.add_argument("--output-dir", default="rag_artifacts/candidates_v2")
+    parser.add_argument("--semantic-split", default="rag_artifacts/finefs_semantic_split.json")
     parser.add_argument("--top-k", type=int, default=8)
     parser.add_argument("--dedup-pool-size", type=int, default=64)
     parser.add_argument("--split", choices=["train", "val", "all"], default="all")
@@ -133,31 +139,25 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     corpus = load_action_corpus(args.corpus)
     checkpoint = torch.load(args.semantic_checkpoint, map_location=device)
-    config = checkpoint.get("config", {})
-    semantic = FineFSSemanticRAG(
-        coarse_classes=len(corpus["coarse_class_vocab"]),
-        elements=len(corpus["element_vocab"]),
-        query_dim=corpus["keys"].shape[1],
-        evidence_dim=int(config.get("evidence_dim", 256)),
-        encoder_hidden_dim=int(config.get("encoder_hidden_dim", 512)),
-        metadata_dim=int(config.get("metadata_dim", 64)),
-        temperature=float(config.get("temperature", 0.07)),
-        dropout=float(config.get("dropout", 0.1)),
-    ).to(device)
-    semantic.load_state_dict(checkpoint["state_dict"], strict=True)
+    semantic = pipeline_from_checkpoint(
+        checkpoint, len(corpus["coarse_class_vocab"]), len(corpus["element_vocab"]),
+        corpus["keys"].shape[1], device,
+    )
     semantic.eval()
-    corpus_keys = corpus["keys"].to(device)
-    coarse_ids = corpus["coarse_class_ids"].to(device)
-    element_ids = corpus["element_ids"].to(device)
-    goe = corpus["goe_grades"].to(device)
-    bv = corpus["bvs"].to(device)
-    panel = corpus["panel_scores"].to(device)
+    manifest = load_video_split(args.semantic_split, corpus)
+    train_videos = set(manifest["splits"]["train"])
+    bank_indices = torch.tensor([
+        i for i, video_id in enumerate(corpus["video_ids"])
+        if str(video_id) in train_videos
+    ], dtype=torch.long)
+    corpus_keys = corpus["keys"][bank_indices].to(device)
+    coarse_ids = corpus["coarse_class_ids"][bank_indices].to(device)
+    element_ids = corpus["element_ids"][bank_indices].to(device)
     with torch.inference_mode():
-        _, reference_retrieval, _ = semantic.encode_reference(
-            corpus_keys, coarse_ids, element_ids, goe, bv, panel
-        )
+        reference_retrieval = semantic.encode_reference_visual(corpus_keys)
     exact_video_map = build_exact_video_map(args.finefs_root, args.fs1000_root)
-    corpus_video_ids = np.asarray(corpus["video_ids"], dtype=object)
+    corpus_video_ids = np.asarray(corpus["video_ids"], dtype=object)[bank_indices.numpy()]
+    checkpoint_hash = hashlib.sha256(open(args.semantic_checkpoint, "rb").read()).hexdigest()
     os.makedirs(args.output_dir, exist_ok=True)
     print("device", device)
     print("corpus_keys", tuple(corpus_keys.shape))
@@ -182,13 +182,11 @@ def main():
             query = torch.from_numpy(np.load(feature_path).astype(np.float32))
             query = F.normalize(query.to(device), dim=-1)
             with torch.inference_mode():
-                query_token, query_retrieval = semantic.encode_query(query)
-                element_logits = semantic.element_head(query_token)
+                predicted = semantic.classify_query(query)
                 similarities = semantic.retrieval_scores(
-                    query_retrieval,
-                    element_logits,
-                    reference_retrieval,
-                    element_ids,
+                    predicted["query_retrieval"], predicted["action_probability"],
+                    predicted["coarse_probabilities"], predicted["element_probabilities"],
+                    reference_retrieval, coarse_ids, element_ids,
                 )
             similarities = similarities.clone()
             excluded_video_id = exact_video_map.get(data_index)
@@ -201,7 +199,7 @@ def main():
                 similarities[:, excluded] = -torch.inf
             indices, values = deduplicated_topk(
                 similarities.detach().cpu(),
-                corpus,
+                {"instance_ids": [corpus["instance_ids"][i] for i in bank_indices.tolist()]},
                 args.top_k,
                 args.dedup_pool_size,
             )
@@ -209,11 +207,15 @@ def main():
                 raise ValueError(f"no valid candidates for one or more queries: {data_index}")
             np.savez_compressed(
                 output_path,
-                candidate_indices=indices.numpy(),
+                candidate_indices=bank_indices[indices].numpy(),
                 candidate_similarities=values.numpy(),
                 corpus_version=np.asarray(corpus["metadata_version"]),
-                retrieval_model=np.asarray("finefs-semantic-rag"),
+                format_version=np.asarray(SEMANTIC_FORMAT_VERSION),
+                retrieval_model=np.asarray("finefs-semantic-soft-route-v2"),
                 semantic_checkpoint=np.asarray(os.path.basename(args.semantic_checkpoint)),
+                semantic_checkpoint_sha256=np.asarray(checkpoint_hash),
+                routing_config=np.asarray(json.dumps({"pool_size": args.dedup_pool_size, "top_k": args.top_k}, sort_keys=True)),
+                top_k=np.asarray(args.top_k),
                 source_feature=os.path.basename(feature_path),
                 excluded_finefs_video=np.asarray(excluded_video_id or ""),
             )

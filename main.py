@@ -15,7 +15,7 @@ from dataset.dataset_fs800 import (
     av_collate_fn_with_static,
 )
 from model import scoring_head
-from semantic_rag import FineFSSemanticRAG
+from semantic_rag import GOE_STAGE, pipeline_from_checkpoint, require_semantic_v2
 
 
 DEFAULT_BASELINE_STATIC_PROJ_DIM = 512
@@ -34,9 +34,9 @@ def parse_args():
         "--static-cache-prefix", default="static_dinov2_cls_patch_mean"
     )
     parser.add_argument("--rag-corpus-path", default="rag_artifacts/action_rag_corpus.pt")
-    parser.add_argument("--candidate-dir", default="rag_artifacts/candidates")
+    parser.add_argument("--candidate-dir", default="rag_artifacts/candidates_v2")
     parser.add_argument("--dynamic-checkpoint", default="/home/v100/ZYQ/skating/rag_results/dynamic/dynamic_seed2026_20260724_004400_best_epoch080_loss83.0444_spear0.8658.pth")
-    parser.add_argument("--semantic-checkpoint", default="/home/v100/ZYQ/skating/rag_results/semantic/semantic_seed2026_20260723_160005_best_epoch050_mrr0.2570_goemae1.3456.pth")
+    parser.add_argument("--semantic-checkpoint", default=None)
     parser.add_argument("--init-checkpoint", default=None)
     parser.add_argument("--output-dir", default="rag_results")
     parser.add_argument("--run-name", default=None)
@@ -333,18 +333,12 @@ def build_model(args, device):
         if not args.semantic_checkpoint:
             raise ValueError("--semantic-checkpoint is required for the rag stage")
         semantic_checkpoint = torch.load(args.semantic_checkpoint, map_location=device)
+        require_semantic_v2(semantic_checkpoint, GOE_STAGE)
         semantic_config = semantic_checkpoint.get("config", {})
-        semantic_model = FineFSSemanticRAG(
-            coarse_classes=len(corpus["coarse_class_vocab"]),
-            elements=len(corpus["element_vocab"]),
-            query_dim=corpus["keys"].shape[1],
-            evidence_dim=int(semantic_config.get("evidence_dim", 256)),
-            encoder_hidden_dim=int(semantic_config.get("encoder_hidden_dim", 512)),
-            metadata_dim=int(semantic_config.get("metadata_dim", 64)),
-            temperature=float(semantic_config.get("temperature", 0.07)),
-            dropout=float(semantic_config.get("dropout", 0.1)),
-        ).to(device)
-        semantic_model.load_state_dict(semantic_checkpoint["state_dict"], strict=True)
+        semantic_model = pipeline_from_checkpoint(
+            semantic_checkpoint, len(corpus["coarse_class_vocab"]),
+            len(corpus["element_vocab"]), corpus["keys"].shape[1], device,
+        )
         semantic_model.eval()
         print("loaded frozen semantic checkpoint:", args.semantic_checkpoint)
         args.semantic_evidence_dim = int(semantic_config.get("evidence_dim", 256))

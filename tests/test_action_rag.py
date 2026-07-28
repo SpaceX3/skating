@@ -174,6 +174,9 @@ class FullModelTest(unittest.TestCase):
             torch.equal(output["tes_dynamic"], output["tes_baseline"])
         )
         self.assertTrue(torch.equal(output["delta_tes_rag"], torch.zeros(batch)))
+        self.assertTrue(torch.isfinite(output["expected_element_embedding"]).all())
+        self.assertTrue(torch.isfinite(output["evidence_delta_goe_grade"]).all())
+        self.assertEqual(output["evidence_reference_goe_grade"].shape, (batch, steps))
         self.assertTrue(
             torch.equal(output["dynamic_valid_mask"][1], torch.tensor([True, True, False]))
         )

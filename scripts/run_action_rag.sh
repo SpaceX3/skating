@@ -15,7 +15,7 @@ SEED="${SEED:-2026}"
 TOP_K="${TOP_K:-8}"
 FINEFS_CACHE="${FINEFS_CACHE:-$FINEFS_ROOT/static_dinov2_cls_patch_mean_rag_cache}"
 CORPUS="${CORPUS:-$PROJECT_ROOT/rag_artifacts/action_rag_corpus.pt}"
-CANDIDATES="${CANDIDATES:-$PROJECT_ROOT/rag_artifacts/candidates}"
+CANDIDATES="${CANDIDATES:-$PROJECT_ROOT/rag_artifacts/candidates_v2}"
 RESULTS="${RESULTS:-$PROJECT_ROOT/rag_results}"
 SEMANTIC_SPLIT="${SEMANTIC_SPLIT:-$PROJECT_ROOT/rag_artifacts/finefs_semantic_split.json}"
 SEMANTIC_RESULTS="${SEMANTIC_RESULTS:-$RESULTS/semantic}"
@@ -33,11 +33,11 @@ Usage:
   bash scripts/run_action_rag.sh finefs-features
   bash scripts/run_action_rag.sh build-corpus
   bash scripts/run_action_rag.sh audit-retrieval
-  bash scripts/run_action_rag.sh candidates
+  SEMANTIC_CHECKPOINT=/path/to/goe_v2.pth bash scripts/run_action_rag.sh candidates-v2
   bash scripts/run_action_rag.sh preprocess-all
   bash scripts/run_action_rag.sh semantic-split
-  bash scripts/run_action_rag.sh semantic-smoke
-  bash scripts/run_action_rag.sh train-semantic
+  bash scripts/run_action_rag.sh train-semantic-classifier
+  CLASSIFIER_CHECKPOINT=/path/to/classifier_v2.pth bash scripts/run_action_rag.sh train-semantic-goe
   SEMANTIC_CHECKPOINT=/path/to/semantic_best.pth bash scripts/run_action_rag.sh semantic-val
   SEMANTIC_CHECKPOINT=/path/to/semantic_best.pth bash scripts/run_action_rag.sh semantic-test
   bash scripts/run_action_rag.sh train-dynamic
@@ -51,7 +51,8 @@ Optional environment variables:
   INIT_CHECKPOINT=/path/to/legacy_checkpoint.pth
   DYNAMIC_CHECKPOINT=/path/to/dynamic_best.pth  # optional override for train-rag
   CHECKPOINT=/path/to/evaluation_checkpoint.pth
-  SEMANTIC_CHECKPOINT=/path/to/finefs_semantic_best.pth
+  CLASSIFIER_CHECKPOINT=/path/to/classifier_v2.pth
+  SEMANTIC_CHECKPOINT=/path/to/goe_v2.pth
 EOF
 }
 
@@ -81,12 +82,12 @@ semantic_split() {
     --seed "$SEED"
 }
 
-train_semantic() {
+train_semantic_classifier() {
   [[ -f "$SEMANTIC_SPLIT" ]] || semantic_split
-  local run_name="semantic_seed${SEED}_$(date +%Y%m%d_%H%M%S)"
+  local run_name="semantic_classifier_seed${SEED}_$(date +%Y%m%d_%H%M%S)"
   mkdir -p "$SEMANTIC_RESULTS"
   "$ACTION_PY" semantic_main.py \
-    --mode train \
+    --mode train-classifier \
     --corpus "$CORPUS" \
     --split-path "$SEMANTIC_SPLIT" \
     --output-dir "$SEMANTIC_RESULTS" \
@@ -95,16 +96,26 @@ train_semantic() {
     --num-workers "$SEMANTIC_NUM_WORKERS" \
     --epochs 200 \
     --lr 3e-4 \
-    --candidate-count 32 \
-    --positive-count 4 \
-    --top-k "$TOP_K" \
-    --retrieval-pool 64 \
     --evidence-dim 256 \
     --encoder-hidden-dim 512 \
     --metadata-dim 64 \
     --dropout 0.1 \
     --gpu "$TRAIN_GPU" \
     --seed "$SEED"
+}
+
+train_semantic_goe() {
+  [[ -f "$SEMANTIC_SPLIT" ]] || semantic_split
+  : "${CLASSIFIER_CHECKPOINT:?Set CLASSIFIER_CHECKPOINT to the v2 classifier checkpoint}"
+  local run_name="semantic_goe_seed${SEED}_$(date +%Y%m%d_%H%M%S)"
+  mkdir -p "$SEMANTIC_RESULTS"
+  "$ACTION_PY" semantic_main.py --mode train-goe --corpus "$CORPUS" \
+    --split-path "$SEMANTIC_SPLIT" --classifier-checkpoint "$CLASSIFIER_CHECKPOINT" \
+    --output-dir "$SEMANTIC_RESULTS" --run-name "$run_name" \
+    --batch-size "$SEMANTIC_BATCH_SIZE" --num-workers "$SEMANTIC_NUM_WORKERS" \
+    --epochs 200 --lr 3e-4 --candidate-count 32 --positive-count 4 \
+    --top-k "$TOP_K" --retrieval-pool 64 --metadata-dim 64 \
+    --gpu "$TRAIN_GPU" --seed "$SEED"
 }
 
 evaluate_semantic() {
@@ -128,7 +139,7 @@ semantic_smoke() {
   [[ -f "$SEMANTIC_SPLIT" ]] || semantic_split
   mkdir -p "$SEMANTIC_RESULTS/smoke"
   "$ACTION_PY" semantic_main.py \
-    --mode train \
+    --mode train-classifier \
     --corpus "$CORPUS" \
     --split-path "$SEMANTIC_SPLIT" \
     --output-dir "$SEMANTIC_RESULTS/smoke" \
@@ -191,6 +202,7 @@ audit_retrieval() {
 }
 
 precompute_candidates() {
+  : "${SEMANTIC_CHECKPOINT:?Set SEMANTIC_CHECKPOINT to the v2 GOE checkpoint}"
   mkdir -p "$CANDIDATES"
   "$ACTION_PY" scripts/precompute_action_candidates.py \
     --fs1000-root "$FS1000_ROOT" \
@@ -198,6 +210,8 @@ precompute_candidates() {
     --query-cache-dir "$FS1000_ROOT/static_dinov2_cls_patch_mean_cache" \
     --query-cache-prefix static_dinov2_cls_patch_mean \
     --corpus "$CORPUS" \
+    --semantic-checkpoint "$SEMANTIC_CHECKPOINT" \
+    --semantic-split "$SEMANTIC_SPLIT" \
     --output-dir "$CANDIDATES" \
     --top-k "$TOP_K" \
     --dedup-pool-size 64 \
@@ -226,6 +240,7 @@ train_dynamic() {
 }
 
 train_rag() {
+  : "${SEMANTIC_CHECKPOINT:?Set SEMANTIC_CHECKPOINT to the v2 GOE checkpoint}"
   if [[ ! -f "$DYNAMIC_CHECKPOINT" ]]; then
     echo "Dynamic checkpoint not found: $DYNAMIC_CHECKPOINT" >&2
     return 2
@@ -240,6 +255,7 @@ train_rag() {
     --rag-corpus-path "$CORPUS" \
     --candidate-dir "$CANDIDATES" \
     --dynamic-checkpoint "$DYNAMIC_CHECKPOINT" \
+    --semantic-checkpoint "$SEMANTIC_CHECKPOINT" \
     --output-dir "$RESULTS/rag" \
     --run-name "$run_name" \
     --batch-size 4 \
@@ -283,10 +299,11 @@ case "${1:-}" in
   finefs-features) finefs_features ;;
   build-corpus) build_corpus ;;
   audit-retrieval) audit_retrieval ;;
-  candidates) precompute_candidates ;;
+  candidates-v2) precompute_candidates ;;
   semantic-split) semantic_split ;;
   semantic-smoke) semantic_smoke ;;
-  train-semantic) train_semantic ;;
+  train-semantic-classifier) train_semantic_classifier ;;
+  train-semantic-goe) train_semantic_goe ;;
   semantic-val) evaluate_semantic val ;;
   semantic-test) evaluate_semantic test ;;
   preprocess-all)
@@ -294,7 +311,6 @@ case "${1:-}" in
     finefs_features
     build_corpus
     audit_retrieval
-    precompute_candidates
     ;;
   train-dynamic) train_dynamic ;;
   train-rag) train_rag ;;

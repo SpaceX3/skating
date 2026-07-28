@@ -385,6 +385,7 @@ class SemanticEvidenceRAG(nn.Module):
         self.semantic = semantic_model
         self.dynamic_dim = int(dynamic_dim)
         self.evidence_dim = int(semantic_model.evidence_dim)
+        self.metadata_dim = int(semantic_model.goe_model.element_embedding.embedding_dim)
         self.delta_max = float(delta_max)
         self.metadata_version = str(corpus["metadata_version"])
         self.video_ids = list(corpus["video_ids"])
@@ -409,15 +410,15 @@ class SemanticEvidenceRAG(nn.Module):
             nn.GELU(),
         )
         self.window_encoder = nn.Sequential(
-            nn.LayerNorm(2 * self.evidence_dim + 10),
-            nn.Linear(2 * self.evidence_dim + 10, self.evidence_dim),
+            nn.LayerNorm(2 * self.evidence_dim + 2 * self.metadata_dim + 14),
+            nn.Linear(2 * self.evidence_dim + 2 * self.metadata_dim + 14, self.evidence_dim),
             nn.GELU(),
             nn.Dropout(0.2),
             nn.Linear(self.evidence_dim, self.evidence_dim),
         )
         self.correction_head = nn.Sequential(
-            nn.LayerNorm(2 * self.evidence_dim + 11),
-            nn.Linear(2 * self.evidence_dim + 11, self.evidence_dim),
+            nn.LayerNorm(2 * self.evidence_dim + 15),
+            nn.Linear(2 * self.evidence_dim + 15, self.evidence_dim),
             nn.GELU(),
             nn.Dropout(0.2),
             nn.Linear(self.evidence_dim, 1),
@@ -487,9 +488,14 @@ class SemanticEvidenceRAG(nn.Module):
 
         query_token = windows("query_token")
         citation_weights = windows("citation_weights")
-        element_probabilities = F.softmax(windows("element_logits"), dim=-1)
+        element_probabilities = windows("element_probabilities")
+        coarse_probabilities = windows("coarse_probabilities")
+        expected_element = element_probabilities @ self.semantic.goe_model.element_embedding.weight
+        expected_coarse = coarse_probabilities @ self.semantic.goe_model.coarse_embedding.weight
         element_entropy = -(element_probabilities.clamp_min(1e-12).log() * element_probabilities).sum(-1)
         element_entropy = element_entropy / max(math.log(max(element_probabilities.shape[-1], 2)), 1e-6)
+        coarse_entropy = -(coarse_probabilities.clamp_min(1e-12).log() * coarse_probabilities).sum(-1)
+        coarse_entropy = coarse_entropy / max(math.log(max(coarse_probabilities.shape[-1], 2)), 1e-6)
         citation_entropy = -(citation_weights.clamp_min(1e-12).log() * citation_weights).sum(-1)
         citation_entropy = citation_entropy / max(math.log(max(candidate_count, 2)), 1e-6)
 
@@ -502,6 +508,8 @@ class SemanticEvidenceRAG(nn.Module):
         margin = top1 - top2
 
         direct_goe = windows("direct_goe")
+        evidence_reference_goe = windows("evidence_reference_goe")
+        evidence_delta_goe = windows("evidence_delta_goe")
         evidence_goe = windows("evidence_goe")
         predicted_goe = windows("predicted_goe")
         goe_gate = windows("goe_gate")
@@ -510,11 +518,15 @@ class SemanticEvidenceRAG(nn.Module):
         scalar_features = torch.stack(
             [
                 direct_goe / 5.0,
+                evidence_reference_goe / 5.0,
+                evidence_delta_goe / 5.0,
                 evidence_goe / 5.0,
                 predicted_goe / 5.0,
                 goe_gate,
                 goe_confidence,
+                windows("action_probability"),
                 element_entropy,
+                coarse_entropy,
                 citation_entropy,
                 torch.tanh(top1 / 10.0),
                 torch.tanh(margin / 10.0),
@@ -523,7 +535,10 @@ class SemanticEvidenceRAG(nn.Module):
             dim=-1,
         )
         window_token = self.window_encoder(
-            torch.cat([query_token, self.dynamic_projection(dynamic_context), scalar_features], dim=-1)
+            torch.cat([
+                query_token, expected_element, expected_coarse,
+                self.dynamic_projection(dynamic_context), scalar_features
+            ], dim=-1)
         )
         window_mask = static_valid_mask
         evidence_mean = masked_mean(window_token, window_mask, dim=1)
@@ -536,7 +551,7 @@ class SemanticEvidenceRAG(nn.Module):
             [evidence_mean, evidence_max, semantic_statistics, tes_baseline.unsqueeze(-1) / 100.0], dim=-1
         )
         raw_delta = self.correction_head(correction_input).squeeze(-1)
-        video_confidence = semantic_statistics[:, 4].clamp(0.0, 1.0)
+        video_confidence = semantic_statistics[:, 6].clamp(0.0, 1.0)
         confidence_gate = 0.25 + 0.75 * video_confidence
         evidence_present = window_mask.any(dim=1)
         delta_tes = self.delta_max * torch.tanh(raw_delta) * confidence_gate
@@ -547,6 +562,10 @@ class SemanticEvidenceRAG(nn.Module):
             "pred_goe_grade": predicted_goe,
             "direct_goe_grade": direct_goe,
             "evidence_goe_grade": evidence_goe,
+            "evidence_reference_goe_grade": evidence_reference_goe,
+            "evidence_delta_goe_grade": evidence_delta_goe,
+            "expected_element_embedding": expected_element,
+            "expected_coarse_embedding": expected_coarse,
             "semantic_goe_gate": goe_gate,
             "citation_indices": candidate_indices,
             "citation_weights": citation_weights,
