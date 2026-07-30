@@ -12,7 +12,15 @@ NUM_WORKERS="${NUM_WORKERS:-8}"
 SEMANTIC_NUM_WORKERS="${SEMANTIC_NUM_WORKERS:-0}"
 SEMANTIC_BATCH_SIZE="${SEMANTIC_BATCH_SIZE:-512}"
 SEED="${SEED:-2026}"
-TOP_K="${TOP_K:-8}"
+# Measured val recall of the correct exact element in the prototype pool:
+# top-8 41.2%, top-16 53.6%, top-64 75.6%. top_k=8 discarded the correct
+# reference for ~59% of queries before GOE aggregation, so evidence GOE was
+# mostly aggregating wrong-element references.
+TOP_K="${TOP_K:-32}"
+# The pool is deduplicated by action instance before top_k is taken, so it must
+# stay comfortably above TOP_K. At pool=64 the worst-case val query yields only
+# 23 unique instances, which is below top_k=32; pool=128 yields at least 45.
+RETRIEVAL_POOL="${RETRIEVAL_POOL:-128}"
 FINEFS_CACHE="${FINEFS_CACHE:-$FINEFS_ROOT/static_dinov2_cls_patch_mean_rag_cache}"
 CORPUS="${CORPUS:-$PROJECT_ROOT/rag_artifacts/action_rag_corpus.pt}"
 CANDIDATES="${CANDIDATES:-$PROJECT_ROOT/rag_artifacts/candidates_v2}"
@@ -114,7 +122,7 @@ train_semantic_goe() {
     --output-dir "$SEMANTIC_RESULTS" --run-name "$run_name" \
     --batch-size "$SEMANTIC_BATCH_SIZE" --num-workers "$SEMANTIC_NUM_WORKERS" \
     --epochs 200 --lr 3e-4 --candidate-count 32 --positive-count 4 \
-    --top-k "$TOP_K" --retrieval-pool 64 --metadata-dim 64 \
+    --top-k "$TOP_K" --retrieval-pool "$RETRIEVAL_POOL" --metadata-dim 64 \
     --gpu "$TRAIN_GPU" --seed "$SEED"
 }
 
@@ -130,7 +138,7 @@ evaluate_semantic() {
     --batch-size 128 \
     --num-workers "$SEMANTIC_NUM_WORKERS" \
     --top-k "$TOP_K" \
-    --retrieval-pool 64 \
+    --retrieval-pool "$RETRIEVAL_POOL" \
     --gpu "$TRAIN_GPU" \
     --seed "$SEED"
 }
@@ -214,7 +222,7 @@ precompute_candidates() {
     --semantic-split "$SEMANTIC_SPLIT" \
     --output-dir "$CANDIDATES" \
     --top-k "$TOP_K" \
-    --dedup-pool-size 64 \
+    --dedup-pool-size "$RETRIEVAL_POOL" \
     --split all \
     --device "cuda:$PREPROCESS_GPU"
 }

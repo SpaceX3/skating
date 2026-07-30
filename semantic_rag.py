@@ -91,8 +91,41 @@ def soft_target_nll(logits, target_weights, valid_mask=None, sample_weights=None
     return (losses[usable] * weights).sum() / weights.sum().clamp_min(1e-12), usable
 
 
+def load_classifier_state(classifier, state_dict, strict=True):
+    """Load a Stage A classifier, dropping the retired retrieval projection.
+
+    Earlier Stage A checkpoints stored a ``retrieval_encoder`` inside the
+    classifier. That module never received gradients during classifier training
+    because the Stage A loss only covers the action/coarse/element heads, so it
+    stayed at its random initialisation and was then frozen into Stage B. The
+    query-side retrieval projection now lives in :class:`ElementConditionedGOE`
+    where the Stage B optimizer trains it. Those stale keys are therefore
+    discarded instead of being reloaded.
+    """
+    retired = sorted(
+        name for name in state_dict if name.startswith("retrieval_encoder.")
+    )
+    if retired:
+        state_dict = {
+            name: value
+            for name, value in state_dict.items()
+            if not name.startswith("retrieval_encoder.")
+        }
+        print(
+            "dropped untrained classifier retrieval projection from checkpoint: "
+            "{}".format(retired)
+        )
+    classifier.load_state_dict(state_dict, strict=strict)
+    return retired
+
+
 class SemanticQueryClassifier(nn.Module):
-    """Query-only action/coarse/exact-element classifier and retrieval encoder."""
+    """Query-only action/coarse/exact-element classifier.
+
+    This module owns classification alone. The retrieval projection used by soft
+    routing lives in :class:`ElementConditionedGOE` so that it is optimized by
+    the Stage B objective rather than frozen at random initialisation.
+    """
 
     def __init__(
         self,
@@ -115,7 +148,6 @@ class SemanticQueryClassifier(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(encoder_hidden_dim, evidence_dim),
         )
-        self.retrieval_encoder = nn.Linear(evidence_dim, evidence_dim)
         self.action_head = nn.Linear(evidence_dim, 1)
         self.coarse_head = nn.Linear(evidence_dim, self.coarse_classes)
         self.element_head = nn.Linear(evidence_dim, self.elements)
@@ -129,7 +161,6 @@ class SemanticQueryClassifier(nn.Module):
         element_logits = self.element_head(token)
         return {
             "query_token": token,
-            "query_retrieval": F.normalize(self.retrieval_encoder(token), dim=-1),
             "action_logit": action_logit,
             "coarse_logits": coarse_logits,
             "element_logits": element_logits,
@@ -165,6 +196,10 @@ class ElementConditionedGOE(nn.Module):
         self.background_coarse_id = int(background_coarse_id)
         self.coarse_embedding = nn.Embedding(self.coarse_classes, metadata_dim)
         self.element_embedding = nn.Embedding(self.elements, metadata_dim)
+        # The query-side retrieval projection is owned by this stage so that the
+        # Stage B retrieval loss trains it. Keeping it in the frozen classifier
+        # left it at random initialisation while still driving soft routing.
+        self.query_retrieval_encoder = nn.Linear(evidence_dim, evidence_dim)
         # Retrieval is visual-only; GOE, BV, panel and labels never enter this encoder.
         self.reference_visual_encoder = nn.Sequential(
             nn.LayerNorm(query_dim),
@@ -209,6 +244,10 @@ class ElementConditionedGOE(nn.Module):
     @staticmethod
     def _coefficient(raw, cap=100.0):
         return F.softplus(raw).clamp(max=cap)
+
+    def encode_query_retrieval(self, query_token):
+        """Project a frozen classifier token into the trainable retrieval space."""
+        return F.normalize(self.query_retrieval_encoder(query_token), dim=-1)
 
     def encode_reference_visual(self, reference_features):
         return F.normalize(self.reference_visual_encoder(reference_features), dim=-1)
@@ -271,9 +310,10 @@ class ElementConditionedGOE(nn.Module):
         if candidate_similarities is None:
             # Raw DINO cosine is explicit pair metadata, not learned retrieval.
             raise ValueError("candidate_similarities (raw DINO cosine) is required")
+        query_retrieval = self.encode_query_retrieval(query_token)
         reference_retrieval = self.encode_reference_visual(reference_features)
         retrieval_logits = self.retrieval_scores(
-            classifier_output["query_retrieval"], classifier_output["action_probability"],
+            query_retrieval, classifier_output["action_probability"],
             classifier_output["coarse_probabilities"], classifier_output["element_probabilities"],
             reference_retrieval, reference_coarse_ids, reference_element_ids, reference_is_action,
         )
@@ -309,6 +349,7 @@ class ElementConditionedGOE(nn.Module):
         predicted_goe = (goe_gate * evidence_goe + (1.0 - goe_gate) * direct_goe).clamp(-5, 5)
         return {
             **classifier_output,
+            "query_retrieval": query_retrieval,
             "reference_retrieval": reference_retrieval,
             "retrieval_logits": retrieval_logits,
             "citation_logits": citation_logits,
@@ -359,7 +400,19 @@ class SemanticPipeline(nn.Module):
         return self
 
     def classify_query(self, query_features):
-        return self.classifier.classify_query(query_features)
+        """Classify a query and attach the trainable retrieval projection.
+
+        ``query_retrieval`` comes from the GOE stage, so full-bank routing and the
+        paired forward path share one trained projection.
+        """
+        output = self.classifier.classify_query(query_features)
+        output["query_retrieval"] = self.goe_model.encode_query_retrieval(
+            output["query_token"]
+        )
+        return output
+
+    def encode_query_retrieval(self, query_token):
+        return self.goe_model.encode_query_retrieval(query_token)
 
     def encode_reference_visual(self, reference_features):
         return self.goe_model.encode_reference_visual(reference_features)
@@ -424,7 +477,7 @@ def pipeline_from_checkpoint(checkpoint, coarse_classes, elements, query_dim, de
     model = build_semantic_pipeline(checkpoint.get("config", {}), coarse_classes, elements, query_dim)
     if "classifier_state_dict" not in checkpoint or "goe_state_dict" not in checkpoint:
         raise ValueError("v2 GOE checkpoint must contain classifier_state_dict and goe_state_dict")
-    model.classifier.load_state_dict(checkpoint["classifier_state_dict"], strict=True)
+    load_classifier_state(model.classifier, checkpoint["classifier_state_dict"])
     model.goe_model.load_state_dict(checkpoint["goe_state_dict"], strict=True)
     model.freeze_classifier()
     if device is not None:

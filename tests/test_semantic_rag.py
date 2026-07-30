@@ -13,6 +13,7 @@ from scripts.build_action_rag_corpus import trimmed_judge_grade
 from semantic_rag import (
     FineFSSemanticRAG,
     SemanticQueryClassifier,
+    load_classifier_state,
     require_candidate_v2,
     require_semantic_v2,
     multi_positive_nll,
@@ -79,6 +80,62 @@ class FineFSSemanticRAGTest(unittest.TestCase):
         self.assertEqual(output["element_probabilities"].shape, (2, 5))
         with self.assertRaises(TypeError):
             classifier.classify_query(torch.randn(2, 6), torch.tensor([1, 2]))
+
+    def test_stage_a_loss_trains_every_classifier_parameter(self):
+        """No classifier parameter may be frozen at random initialisation.
+
+        The retrieval projection used to live here and never received Stage A
+        gradients, so it entered Stage B random and frozen.
+        """
+        classifier = SemanticQueryClassifier(5, 5, 6, 8, 16, 0.0)
+        output = classifier(torch.randn(4, 6))
+        loss = (
+            output["action_logit"].square().mean()
+            + output["coarse_logits"].square().mean()
+            + output["element_logits"].square().mean()
+        )
+        loss.backward()
+        missing = [
+            name
+            for name, parameter in classifier.named_parameters()
+            if parameter.grad is None
+        ]
+        self.assertEqual(missing, [])
+
+    def test_query_retrieval_projection_is_trained_by_stage_b(self):
+        """Soft routing must use a projection owned by the trainable GOE stage."""
+        model = self.make_model()
+        model.freeze_classifier()
+        trainable = dict(model.goe_model.named_parameters())
+        self.assertIn("query_retrieval_encoder.weight", trainable)
+        output = model.classify_query(torch.randn(2, 6))
+        output["query_retrieval"].square().mean().backward()
+        self.assertIsNotNone(trainable["query_retrieval_encoder.weight"].grad)
+        for parameter in model.classifier.parameters():
+            self.assertIsNone(parameter.grad)
+
+    def test_retrieval_logits_reach_the_query_projection(self):
+        model = self.make_model()
+        model.freeze_classifier()
+        output = model(
+            torch.randn(1, 6), torch.randn(1, 2, 6), torch.tensor([[2, 3]]),
+            torch.tensor([[2, 3]]), torch.tensor([[1.0, -1.0]]),
+            torch.ones(1, 2), torch.ones(1, 2), torch.tensor([[True, True]]),
+        )
+        output["retrieval_logits"].sum().backward()
+        gradient = model.goe_model.query_retrieval_encoder.weight.grad
+        self.assertIsNotNone(gradient)
+        self.assertGreater(float(gradient.abs().sum()), 0.0)
+
+    def test_stale_classifier_retrieval_keys_are_dropped(self):
+        classifier = SemanticQueryClassifier(5, 5, 6, 8, 16, 0.0)
+        state = dict(classifier.state_dict())
+        state["retrieval_encoder.weight"] = torch.randn(8, 8)
+        state["retrieval_encoder.bias"] = torch.randn(8)
+        retired = load_classifier_state(classifier, state)
+        self.assertEqual(
+            retired, ["retrieval_encoder.bias", "retrieval_encoder.weight"]
+        )
 
     def test_soft_route_probability_is_monotonic_and_not_hard_top1(self):
         model = self.make_model()

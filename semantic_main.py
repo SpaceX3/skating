@@ -28,6 +28,7 @@ from semantic_rag import (
     FineFSSemanticRAG,
     SemanticQueryClassifier,
     build_semantic_pipeline,
+    load_classifier_state,
     multi_positive_nll,
     pipeline_from_checkpoint,
     require_semantic_v2,
@@ -63,8 +64,14 @@ def parse_args():
     parser.add_argument("--gamma", type=float, default=0.5)
     parser.add_argument("--candidate-count", type=int, default=32)
     parser.add_argument("--positive-count", type=int, default=4)
-    parser.add_argument("--top-k", type=int, default=8)
-    parser.add_argument("--retrieval-pool", type=int, default=64)
+    # Measured val recall of the correct exact element in the prototype pool:
+    # top-8 41.2%, top-16 53.6%, top-64 75.6%. A small top_k discards the correct
+    # reference before GOE aggregation, so evidence GOE ends up averaging
+    # wrong-element references.
+    parser.add_argument("--top-k", type=int, default=32)
+    # deduplicated_indices() collapses the pool by action instance before taking
+    # top_k, so the pool must stay well above top_k or it raises.
+    parser.add_argument("--retrieval-pool", type=int, default=128)
     parser.add_argument("--reference-batch-size", type=int, default=1024)
     parser.add_argument("--evidence-dim", type=int, default=256)
     parser.add_argument("--encoder-hidden-dim", type=int, default=512)
@@ -548,7 +555,13 @@ def deduplicated_indices(top_indices, bank_indices, bank_instance_ids, top_k):
     positions = positions.expand_as(top_indices).masked_fill(has_previous, pool_size)
     chosen_positions = positions.topk(top_k, dim=1, largest=False).values
     if bool(chosen_positions.ge(pool_size).any()):
-        raise ValueError("retrieval pool is too small after instance deduplication")
+        shortfall = int(chosen_positions.ge(pool_size).any(dim=1).sum())
+        raise ValueError(
+            "retrieval pool of {} collapsed below top_k={} after action-instance "
+            "deduplication for {} quer{}; raise --retrieval-pool".format(
+                pool_size, top_k, shortfall, "y" if shortfall == 1 else "ies"
+            )
+        )
     selected_bank_positions = top_indices.gather(1, chosen_positions)
     return bank_indices[selected_bank_positions]
 
@@ -1009,7 +1022,7 @@ def train_goe(args, corpus, manifest, device):
         config, len(corpus["coarse_class_vocab"]), len(corpus["element_vocab"]),
         corpus["keys"].shape[1],
     ).to(device)
-    model.classifier.load_state_dict(classifier_checkpoint["classifier_state_dict"], strict=True)
+    load_classifier_state(model.classifier, classifier_checkpoint["classifier_state_dict"])
     model.freeze_classifier()
     model.set_element_goe_prior(
         element_goe_priors(corpus, manifest["splits"]["train"])
