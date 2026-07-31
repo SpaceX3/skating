@@ -9,9 +9,10 @@ from semantic_data import (
     validate_video_split,
 )
 from semantic_main import deduplicated_indices, gather, prepare_device_corpus
-from scripts.build_action_rag_corpus import trimmed_judge_grade
+from scripts.build_action_rag_corpus import pack_ordered_sequence, trimmed_judge_grade
 from semantic_rag import (
     FineFSSemanticRAG,
+    OrderedInteractionEncoder,
     SemanticQueryClassifier,
     load_classifier_state,
     require_candidate_v2,
@@ -89,6 +90,73 @@ class FineFSSemanticRAGTest(unittest.TestCase):
         """
         classifier = SemanticQueryClassifier(5, 5, 6, 8, 16, 0.0)
         output = classifier(torch.randn(4, 6))
+        loss = (
+            output["action_logit"].square().mean()
+            + output["coarse_logits"].square().mean()
+            + output["element_logits"].square().mean()
+        )
+        loss.backward()
+        missing = [
+            name
+            for name, parameter in classifier.named_parameters()
+            if parameter.grad is None
+        ]
+        self.assertEqual(missing, [])
+
+    def test_ordered_interaction_reverses_antisymmetric_pairs(self):
+        torch.manual_seed(17)
+        encoder = OrderedInteractionEncoder(
+            input_dim=6,
+            output_dim=8,
+            projection_dim=3,
+            time_basis=1,
+            hidden_dim=8,
+            dropout=0.0,
+        )
+        frames = torch.randn(1, 4, 6)
+        times = torch.tensor([[0.0, 1.0, 2.0, 3.0]])
+        mask = torch.ones(1, 4, dtype=torch.bool)
+        _, forward_pairs = encoder.path_features(frames, times, mask)
+        _, reverse_pairs = encoder.path_features(frames.flip(1), times, mask)
+        self.assertGreater(float(forward_pairs.abs().sum()), 0.0)
+        self.assertTrue(
+            torch.allclose(reverse_pairs, -forward_pairs, atol=1e-5, rtol=1e-5)
+        )
+
+    def test_ordered_classifier_uses_sequence_without_mean_encoder(self):
+        classifier = SemanticQueryClassifier(
+            5,
+            5,
+            6,
+            8,
+            16,
+            0.0,
+            ordered_enabled=True,
+            ordered_projection_dim=3,
+            ordered_time_basis=2,
+            ordered_hidden_dim=12,
+        )
+        self.assertIsNone(classifier.query_encoder)
+        with self.assertRaisesRegex(ValueError, "requires frame features"):
+            classifier(torch.randn(2, 6))
+        frame_features = torch.randn(2, 4, 6)
+        frame_times = torch.arange(4).repeat(2, 1).float()
+        frame_mask = torch.ones(2, 4, dtype=torch.bool)
+        output = classifier(
+            torch.randn(2, 6),
+            ordered_frame_features=frame_features,
+            ordered_frame_times=frame_times,
+            ordered_frame_mask=frame_mask,
+        )
+        changed_mean_output = classifier(
+            torch.randn(2, 6) * 100.0,
+            ordered_frame_features=frame_features,
+            ordered_frame_times=frame_times,
+            ordered_frame_mask=frame_mask,
+        )
+        self.assertEqual(output["query_token"].shape, (2, 8))
+        for name in ("query_token", "action_logit", "coarse_logits", "element_logits"):
+            self.assertTrue(torch.equal(output[name], changed_mean_output[name]))
         loss = (
             output["action_logit"].square().mean()
             + output["coarse_logits"].square().mean()
@@ -229,6 +297,26 @@ class FineFSSemanticRAGTest(unittest.TestCase):
 
 
 class SemanticDataTest(unittest.TestCase):
+    def test_ordered_sequence_pack_is_chronological_and_masked(self):
+        features = torch.arange(2 * 3 * 2).reshape(2, 3, 2).numpy()
+        times = torch.tensor([[2.0, 1.0, 3.0], [6.0, 4.0, 5.0]]).numpy()
+        packed, packed_times, mask = pack_ordered_sequence(
+            features, times, torch.tensor([0, 1]).numpy(), 8
+        )
+        self.assertEqual(mask.sum(), 6)
+        self.assertTrue((packed_times[:6] == sorted(packed_times[:6])).all())
+        self.assertEqual(packed.shape, (8, 2))
+
+    def test_ordered_corpus_moves_only_gathered_frames_to_device(self):
+        corpus = synthetic_semantic_corpus()
+        corpus["ordered_frame_features"] = torch.randn(8, 4, 6).half()
+        corpus["ordered_frame_times"] = torch.arange(4).repeat(8, 1).float()
+        corpus["ordered_frame_mask"] = torch.ones(8, 4, dtype=torch.bool)
+        prepared = prepare_device_corpus(corpus, torch.device("cpu"))
+        batch = gather(prepared, torch.tensor([1, 3]))
+        self.assertEqual(batch["ordered_frame_features"].shape, (2, 4, 6))
+        self.assertEqual(batch["ordered_frame_features"].dtype, torch.float32)
+
     def test_minus_six_judge_sentinel_is_not_a_valid_goe(self):
         value = trimmed_judge_grade({"judge_score": [-6] * 9})
         self.assertTrue(torch.isnan(torch.tensor(value)))

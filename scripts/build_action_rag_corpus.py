@@ -97,7 +97,7 @@ def find_cache_pair(cache_dir, cache_prefix, video_id):
     return feature_path, times_path
 
 
-def select_prototypes(features, times, start, end, limit):
+def select_prototype_groups(times, start, end, limit):
     sample_start = times[:, 2]
     sample_end = times[:, 3]
     overlap = np.maximum(0.0, np.minimum(sample_end, end) - np.maximum(sample_start, start))
@@ -106,8 +106,50 @@ def select_prototypes(features, times, start, end, limit):
         centers = (sample_start + sample_end) / 2.0
         action_center = 0.5 * (start + end)
         indices = np.asarray([int(np.argmin(np.abs(centers - action_center)))])
-    bins = np.array_split(indices, min(limit, len(indices)))
-    return [features[group].mean(axis=0) for group in bins if len(group)]
+    return [group for group in np.array_split(indices, min(limit, len(indices))) if len(group)]
+
+
+def select_prototypes(features, times, start, end, limit):
+    return [
+        features[group].mean(axis=0)
+        for group in select_prototype_groups(times, start, end, limit)
+    ]
+
+
+def pack_ordered_sequence(frame_features, frame_times, group, sequence_length):
+    values = frame_features[group].reshape(-1, frame_features.shape[-1])
+    timestamps = frame_times[group].reshape(-1)
+    order = np.argsort(timestamps, kind="stable")
+    values = values[order]
+    timestamps = timestamps[order]
+
+    # Sampling with replacement can produce duplicate frame timestamps. One copy
+    # is sufficient because every duplicate carries the same frozen DINO vector.
+    _, unique_positions = np.unique(timestamps, return_index=True)
+    unique_positions.sort()
+    values = values[unique_positions]
+    timestamps = timestamps[unique_positions]
+    if len(values) > sequence_length:
+        positions = np.linspace(0, len(values) - 1, sequence_length)
+        positions = np.rint(positions).astype(np.int64)
+        values = values[positions]
+        timestamps = timestamps[positions]
+
+    values = values.astype(np.float32)
+    values = values / np.maximum(
+        np.linalg.norm(values, axis=-1, keepdims=True), 1e-12
+    )
+
+    count = len(values)
+    packed_values = np.zeros(
+        (sequence_length, frame_features.shape[-1]), dtype=np.float16
+    )
+    packed_times = np.zeros(sequence_length, dtype=np.float32)
+    packed_mask = np.zeros(sequence_length, dtype=np.bool_)
+    packed_values[:count] = values.astype(np.float16)
+    packed_times[:count] = timestamps.astype(np.float32)
+    packed_mask[:count] = True
+    return packed_values, packed_times, packed_mask
 
 
 def build_corpus(args):
@@ -134,6 +176,30 @@ def build_corpus(args):
             raise ValueError(f"unexpected feature shape {features.shape}: {feature_path}")
         if times.shape != (features.shape[0], 4):
             raise ValueError(f"unexpected time shape {times.shape}: {times_path}")
+        frame_features = None
+        frame_times = None
+        if args.include_ordered_sequences:
+            frame_feature_path, frame_times_path = find_cache_pair(
+                args.cache_dir,
+                args.frame_cache_prefix or args.cache_prefix + "_frames",
+                video_id,
+            )
+            frame_features = np.load(frame_feature_path, mmap_mode="r")
+            frame_times = np.load(frame_times_path).astype(np.float32)
+            if (
+                frame_features.ndim != 3
+                or frame_features.shape[0] != features.shape[0]
+                or frame_features.shape[2] != args.feature_dim
+            ):
+                raise ValueError(
+                    f"unexpected ordered frame shape {frame_features.shape}: "
+                    f"{frame_feature_path}"
+                )
+            if frame_times.shape != frame_features.shape[:2]:
+                raise ValueError(
+                    f"unexpected ordered frame time shape {frame_times.shape}: "
+                    f"{frame_times_path}"
+                )
         with open(annotation_path, "r", encoding="utf-8") as handle:
             annotation = json.load(handle)
         if annotation_signature(annotation) in val_signatures:
@@ -153,13 +219,10 @@ def build_corpus(args):
             element_name = canonical_element(element.get("element"))
             coarse = infer_coarse(element_name, element.get("coarse_class"))
             element_names.add(element_name)
-            prototypes = select_prototypes(
-                features,
-                times,
-                start,
-                end,
-                PROTOTYPE_LIMITS[coarse],
+            prototype_groups = select_prototype_groups(
+                times, start, end, PROTOTYPE_LIMITS[coarse]
             )
+            prototypes = [features[group].mean(axis=0) for group in prototype_groups]
             goe_grade = trimmed_judge_grade(element)
             goe_points = float(element.get("goe", float("nan")))
             bv = float(element.get("bv", float("nan")))
@@ -167,9 +230,10 @@ def build_corpus(args):
             valid_score = all(
                 np.isfinite(value) for value in (goe_grade, bv, panel_score)
             )
-            for prototype_index, prototype in enumerate(prototypes):
-                entries.append(
-                    {
+            for prototype_index, (prototype, group) in enumerate(
+                zip(prototypes, prototype_groups)
+            ):
+                entry = {
                         "key": prototype,
                         "video_id": video_id,
                         "instance_id": f"{video_id}:{name}",
@@ -185,7 +249,21 @@ def build_corpus(args):
                         "end_time": end,
                         "valid_score": valid_score,
                     }
-                )
+                if args.include_ordered_sequences:
+                    sequence, sequence_times, sequence_mask = pack_ordered_sequence(
+                        frame_features,
+                        frame_times,
+                        group,
+                        args.ordered_sequence_length,
+                    )
+                    entry.update(
+                        {
+                            "ordered_frame_features": sequence,
+                            "ordered_frame_times": sequence_times,
+                            "ordered_frame_mask": sequence_mask,
+                        }
+                    )
+                entries.append(entry)
             stats[coarse] += 1
         background_candidates = []
         for token_index, token_times in enumerate(times):
@@ -205,8 +283,7 @@ def build_corpus(args):
             )
             for background_index, candidate_position in enumerate(selected_positions):
                 token_index = background_candidates[int(candidate_position)]
-                entries.append(
-                    {
+                entry = {
                         "key": features[token_index],
                         "video_id": video_id,
                         "instance_id": f"{video_id}:background:{background_index}",
@@ -222,7 +299,21 @@ def build_corpus(args):
                         "end_time": float(times[token_index, 3]),
                         "valid_score": False,
                     }
-                )
+                if args.include_ordered_sequences:
+                    sequence, sequence_times, sequence_mask = pack_ordered_sequence(
+                        frame_features,
+                        frame_times,
+                        np.asarray([token_index]),
+                        args.ordered_sequence_length,
+                    )
+                    entry.update(
+                        {
+                            "ordered_frame_features": sequence,
+                            "ordered_frame_times": sequence_times,
+                            "ordered_frame_mask": sequence_mask,
+                        }
+                    )
+                entries.append(entry)
                 stats["background"] += 1
         stats["videos"] += 1
 
@@ -273,13 +364,41 @@ def build_corpus(args):
         ),
         "coarse_class_vocab": COARSE_CLASSES,
         "element_vocab": element_vocab,
-        "metadata_version": "finefs-action-rag-v1",
+        "metadata_version": (
+            "finefs-action-rag-v2-ordered"
+            if args.include_ordered_sequences
+            else "finefs-action-rag-v1"
+        ),
         "source": "FineFS annotations and DINOv2 ViT-L/14 CLS+patch-mean caches",
     }
+    if args.include_ordered_sequences:
+        corpus.update(
+            {
+                "ordered_frame_features": torch.from_numpy(
+                    np.stack(
+                        [entry["ordered_frame_features"] for entry in entries]
+                    )
+                ),
+                "ordered_frame_times": torch.from_numpy(
+                    np.stack([entry["ordered_frame_times"] for entry in entries])
+                ),
+                "ordered_frame_mask": torch.from_numpy(
+                    np.stack([entry["ordered_frame_mask"] for entry in entries])
+                ),
+                "ordered_sequence_length": int(args.ordered_sequence_length),
+            }
+        )
+        corpus["source"] += " with ordered per-frame sidecars"
     os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
     torch.save(corpus, args.output)
     print("saved", args.output)
     print("keys", tuple(keys.shape))
+    if args.include_ordered_sequences:
+        print(
+            "ordered_frame_features",
+            tuple(corpus["ordered_frame_features"].shape),
+            corpus["ordered_frame_features"].dtype,
+        )
     print("action_instances", sum(stats[name] for name in PROTOTYPE_LIMITS))
     print("prototypes", len(entries))
     print("valid_score_prototypes", int(corpus["valid_score_mask"].sum()))
@@ -297,12 +416,18 @@ def main():
     parser.add_argument(
         "--cache-prefix", default="static_dinov2_cls_patch_mean"
     )
+    parser.add_argument("--frame-cache-prefix", default=None)
+    parser.add_argument("--include-ordered-sequences", action="store_true")
+    parser.add_argument("--ordered-sequence-length", type=int, default=8)
     parser.add_argument("--feature-dim", type=int, default=2048)
     parser.add_argument("--max-background-per-video", type=int, default=3)
     parser.add_argument("--only-video-id", default=None)
     parser.add_argument("--limit-videos", type=int, default=None)
     parser.add_argument("--output", default="rag_artifacts/action_rag_corpus.pt")
-    build_corpus(parser.parse_args())
+    args = parser.parse_args()
+    if args.ordered_sequence_length < 2:
+        raise ValueError("--ordered-sequence-length must be at least 2")
+    build_corpus(args)
 
 
 if __name__ == "__main__":

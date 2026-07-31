@@ -119,6 +119,133 @@ def load_classifier_state(classifier, state_dict, strict=True):
     return retired
 
 
+class OrderedInteractionEncoder(nn.Module):
+    """Encode frozen frame features with first- and second-order path terms."""
+
+    def __init__(
+        self,
+        input_dim,
+        output_dim,
+        projection_dim=16,
+        time_basis=2,
+        hidden_dim=256,
+        dropout=0.1,
+    ):
+        super().__init__()
+        if projection_dim <= 0:
+            raise ValueError("ordered projection_dim must be positive")
+        if time_basis <= 0:
+            raise ValueError("ordered time_basis must be positive")
+        self.input_dim = int(input_dim)
+        self.output_dim = int(output_dim)
+        self.projection_dim = int(projection_dim)
+        self.time_basis = int(time_basis)
+        self.channels = self.projection_dim * self.time_basis
+        self.pair_dim = self.channels * (self.channels - 1) // 2
+        self.frame_projection = nn.Sequential(
+            nn.LayerNorm(self.input_dim),
+            nn.Linear(self.input_dim, self.projection_dim),
+            nn.GELU(),
+        )
+        descriptor_dim = self.channels + self.pair_dim
+        self.descriptor_encoder = nn.Sequential(
+            nn.LayerNorm(descriptor_dim),
+            nn.Linear(descriptor_dim, int(hidden_dim)),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(int(hidden_dim), self.output_dim),
+        )
+        pair_indices = torch.triu_indices(
+            self.channels, self.channels, offset=1
+        )
+        self.register_buffer("pair_rows", pair_indices[0], persistent=False)
+        self.register_buffer("pair_cols", pair_indices[1], persistent=False)
+
+    @staticmethod
+    def _normalized_times(frame_times, frame_mask):
+        positive_inf = torch.full_like(frame_times, torch.inf)
+        negative_inf = torch.full_like(frame_times, -torch.inf)
+        first = torch.where(frame_mask, frame_times, positive_inf).amin(
+            dim=1, keepdim=True
+        )
+        last = torch.where(frame_mask, frame_times, negative_inf).amax(
+            dim=1, keepdim=True
+        )
+        duration = (last - first).clamp_min(0.0)
+        normalized = (frame_times - first) / duration.clamp_min(1e-6)
+        return torch.where(frame_mask, normalized, torch.zeros_like(normalized))
+
+    @staticmethod
+    def _trapezoid_weights(normalized_times, frame_mask):
+        adjacent = frame_mask[:, 1:] & frame_mask[:, :-1]
+        intervals = (normalized_times[:, 1:] - normalized_times[:, :-1])
+        intervals = intervals.clamp_min(0.0) * adjacent.to(normalized_times.dtype)
+        weights = torch.zeros_like(normalized_times)
+        weights[:, :-1] += 0.5 * intervals
+        weights[:, 1:] += 0.5 * intervals
+        weight_sum = weights.sum(dim=1, keepdim=True)
+        uniform = frame_mask.to(normalized_times.dtype)
+        uniform = uniform / uniform.sum(dim=1, keepdim=True).clamp_min(1.0)
+        weights = torch.where(weight_sum.gt(0), weights / weight_sum.clamp_min(1e-6), uniform)
+        return weights * frame_mask.to(weights.dtype)
+
+    def _legendre_basis(self, normalized_times):
+        x = 2.0 * normalized_times - 1.0
+        values = [torch.ones_like(x)]
+        if self.time_basis > 1:
+            values.append(x)
+        for degree in range(2, self.time_basis):
+            current = (
+                (2 * degree - 1) * x * values[-1]
+                - (degree - 1) * values[-2]
+            ) / degree
+            values.append(current)
+        return torch.stack(values, dim=-1)
+
+    def path_features(self, frame_features, frame_times, frame_mask):
+        if frame_features.ndim != 3 or frame_features.shape[-1] != self.input_dim:
+            raise ValueError(
+                "ordered frame_features must have shape [B,T,input_dim]"
+            )
+        if frame_times.shape != frame_features.shape[:2]:
+            raise ValueError("ordered frame_times must have shape [B,T]")
+        if frame_mask.shape != frame_features.shape[:2]:
+            raise ValueError("ordered frame_mask must have shape [B,T]")
+        frame_mask = frame_mask.bool()
+        if not frame_mask.any(dim=1).all():
+            raise ValueError("every ordered query must contain at least one frame")
+
+        frame_features = frame_features.float()
+        frame_times = frame_times.to(frame_features.dtype)
+        normalized_times = self._normalized_times(frame_times, frame_mask)
+        weights = self._trapezoid_weights(normalized_times, frame_mask)
+        projected = self.frame_projection(frame_features)
+        basis = self._legendre_basis(normalized_times)
+        increments = basis.unsqueeze(-1) * projected.unsqueeze(-2)
+        increments = increments.flatten(start_dim=2)
+        increments = increments * weights.unsqueeze(-1)
+
+        first_order = increments.sum(dim=1)
+        prefix = increments.cumsum(dim=1) - increments
+        second_order = torch.einsum("bti,btj->bij", prefix, increments)
+        antisymmetric = 0.5 * (
+            second_order - second_order.transpose(1, 2)
+        )
+        ordered_pairs = antisymmetric[:, self.pair_rows, self.pair_cols]
+        ordered_pairs = torch.sign(ordered_pairs) * torch.sqrt(
+            ordered_pairs.abs() + 1e-8
+        )
+        return first_order, ordered_pairs
+
+    def forward(self, frame_features, frame_times, frame_mask):
+        first_order, ordered_pairs = self.path_features(
+            frame_features, frame_times, frame_mask
+        )
+        return self.descriptor_encoder(
+            torch.cat([first_order, ordered_pairs], dim=-1)
+        )
+
+
 class SemanticQueryClassifier(nn.Module):
     """Query-only action/coarse/exact-element classifier.
 
@@ -135,27 +262,71 @@ class SemanticQueryClassifier(nn.Module):
         evidence_dim=256,
         encoder_hidden_dim=512,
         dropout=0.1,
+        ordered_enabled=False,
+        ordered_projection_dim=16,
+        ordered_time_basis=2,
+        ordered_hidden_dim=256,
     ):
         super().__init__()
         self.query_dim = int(query_dim)
         self.evidence_dim = int(evidence_dim)
         self.coarse_classes = int(coarse_classes)
         self.elements = int(elements)
-        self.query_encoder = nn.Sequential(
-            nn.LayerNorm(query_dim),
-            nn.Linear(query_dim, encoder_hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(encoder_hidden_dim, evidence_dim),
-        )
+        self.ordered_enabled = bool(ordered_enabled)
+        if self.ordered_enabled:
+            self.query_encoder = None
+            self.ordered_encoder = OrderedInteractionEncoder(
+                query_dim,
+                evidence_dim,
+                projection_dim=ordered_projection_dim,
+                time_basis=ordered_time_basis,
+                hidden_dim=ordered_hidden_dim,
+                dropout=dropout,
+            )
+        else:
+            self.query_encoder = nn.Sequential(
+                nn.LayerNorm(query_dim),
+                nn.Linear(query_dim, encoder_hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(encoder_hidden_dim, evidence_dim),
+            )
+            self.ordered_encoder = None
         self.action_head = nn.Linear(evidence_dim, 1)
         self.coarse_head = nn.Linear(evidence_dim, self.coarse_classes)
         self.element_head = nn.Linear(evidence_dim, self.elements)
 
-    def classify_query(self, query_features):
+    def classify_query(
+        self,
+        query_features,
+        *,
+        ordered_frame_features=None,
+        ordered_frame_times=None,
+        ordered_frame_mask=None,
+    ):
         if query_features.ndim != 2 or query_features.shape[-1] != self.query_dim:
             raise ValueError("query_features must have shape [B,query_dim]")
-        token = self.query_encoder(query_features)
+        if self.ordered_enabled:
+            if any(
+                value is None
+                for value in (
+                    ordered_frame_features,
+                    ordered_frame_times,
+                    ordered_frame_mask,
+                )
+            ):
+                raise ValueError(
+                    "ordered classifier requires frame features, times, and mask"
+                )
+            if ordered_frame_features.shape[0] != query_features.shape[0]:
+                raise ValueError("query and ordered frame batch sizes differ")
+            token = self.ordered_encoder(
+                ordered_frame_features,
+                ordered_frame_times,
+                ordered_frame_mask,
+            )
+        else:
+            token = self.query_encoder(query_features)
         action_logit = self.action_head(token).squeeze(-1)
         coarse_logits = self.coarse_head(token)
         element_logits = self.element_head(token)
@@ -169,8 +340,8 @@ class SemanticQueryClassifier(nn.Module):
             "element_probabilities": F.softmax(element_logits, dim=-1),
         }
 
-    def forward(self, query_features):
-        return self.classify_query(query_features)
+    def forward(self, query_features, **kwargs):
+        return self.classify_query(query_features, **kwargs)
 
 
 class ElementConditionedGOE(nn.Module):
@@ -399,13 +570,13 @@ class SemanticPipeline(nn.Module):
             self.classifier.eval()
         return self
 
-    def classify_query(self, query_features):
+    def classify_query(self, query_features, **kwargs):
         """Classify a query and attach the trainable retrieval projection.
 
         ``query_retrieval`` comes from the GOE stage, so full-bank routing and the
         paired forward path share one trained projection.
         """
-        output = self.classifier.classify_query(query_features)
+        output = self.classifier.classify_query(query_features, **kwargs)
         output["query_retrieval"] = self.goe_model.encode_query_retrieval(
             output["query_token"]
         )
@@ -426,8 +597,8 @@ class SemanticPipeline(nn.Module):
         return visual, visual, numeric
 
     # Small convenience surface used by full-bank mining/evaluation.
-    def encode_query(self, query_features):
-        output = self.classify_query(query_features)
+    def encode_query(self, query_features, **kwargs):
+        output = self.classify_query(query_features, **kwargs)
         return output["query_token"], output["query_retrieval"]
 
     @property
@@ -443,9 +614,16 @@ class SemanticPipeline(nn.Module):
     def forward(
         self, query_features, reference_features=None, reference_coarse_ids=None,
         reference_element_ids=None, reference_goe=None, reference_bv=None,
-        reference_panel=None, reference_score_valid=None, **kwargs
+        reference_panel=None, reference_score_valid=None,
+        ordered_frame_features=None, ordered_frame_times=None,
+        ordered_frame_mask=None, **kwargs
     ):
-        classification = self.classify_query(query_features)
+        classification = self.classify_query(
+            query_features,
+            ordered_frame_features=ordered_frame_features,
+            ordered_frame_times=ordered_frame_times,
+            ordered_frame_mask=ordered_frame_mask,
+        )
         if kwargs.get("candidate_similarities") is None and reference_features is not None:
             kwargs["candidate_similarities"] = F.cosine_similarity(
                 query_features.unsqueeze(1), reference_features, dim=-1
@@ -462,6 +640,10 @@ def build_semantic_pipeline(config, coarse_classes, elements, query_dim):
         coarse_classes, elements, query_dim,
         int(config.get("evidence_dim", 256)), int(config.get("encoder_hidden_dim", 512)),
         float(config.get("dropout", 0.1)),
+        bool(config.get("ordered_enabled", False)),
+        int(config.get("ordered_projection_dim", 16)),
+        int(config.get("ordered_time_basis", 2)),
+        int(config.get("ordered_hidden_dim", 256)),
     )
     goe = ElementConditionedGOE(
         coarse_classes, elements, query_dim,
@@ -495,10 +677,13 @@ class FineFSSemanticRAG(SemanticPipeline):
     def __init__(
         self, coarse_classes, elements, query_dim=2048, evidence_dim=256,
         encoder_hidden_dim=512, metadata_dim=64, temperature=0.07, dropout=0.1,
+        ordered_enabled=False, ordered_projection_dim=16,
+        ordered_time_basis=2, ordered_hidden_dim=256,
     ):
         classifier = SemanticQueryClassifier(
             coarse_classes, elements, query_dim, evidence_dim,
-            encoder_hidden_dim, dropout,
+            encoder_hidden_dim, dropout, ordered_enabled,
+            ordered_projection_dim, ordered_time_basis, ordered_hidden_dim,
         )
         goe = ElementConditionedGOE(
             coarse_classes, elements, query_dim, evidence_dim,

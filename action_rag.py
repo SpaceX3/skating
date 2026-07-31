@@ -63,6 +63,43 @@ def load_action_corpus(path, map_location="cpu"):
             raise ValueError("corpus field {!r} has length {}, expected {}".format(
                 name, len(corpus[name]), size
             ))
+    ordered_fields = {
+        "ordered_frame_features",
+        "ordered_frame_times",
+        "ordered_frame_mask",
+    }
+    present_ordered = ordered_fields.intersection(corpus)
+    if present_ordered and present_ordered != ordered_fields:
+        raise KeyError(
+            "ordered action corpus must contain all of {}".format(
+                sorted(ordered_fields)
+            )
+        )
+    if present_ordered:
+        frame_features = corpus["ordered_frame_features"]
+        frame_times = corpus["ordered_frame_times"].float()
+        frame_mask = corpus["ordered_frame_mask"].bool()
+        if (
+            frame_features.ndim != 3
+            or frame_features.shape[0] != size
+            or frame_features.shape[2] != keys.shape[1]
+        ):
+            raise ValueError(
+                "ordered_frame_features must have shape [N,T,D] matching keys"
+            )
+        if frame_times.shape != frame_features.shape[:2]:
+            raise ValueError("ordered_frame_times must have shape [N,T]")
+        if frame_mask.shape != frame_features.shape[:2]:
+            raise ValueError("ordered_frame_mask must have shape [N,T]")
+        if not frame_mask.any(dim=1).all():
+            raise ValueError("every ordered sequence must contain at least one frame")
+        if not torch.isfinite(frame_features.float()).all():
+            raise ValueError("ordered_frame_features contain NaN/Inf")
+        if not torch.isfinite(frame_times[frame_mask]).all():
+            raise ValueError("ordered_frame_times contain NaN/Inf on valid frames")
+        corpus["ordered_frame_features"] = frame_features.half()
+        corpus["ordered_frame_times"] = frame_times
+        corpus["ordered_frame_mask"] = frame_mask
     return corpus
 
 
