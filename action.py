@@ -42,20 +42,6 @@ def times_path(cache_dir, cache_prefix, data_index, t_dyn):
     )
 
 
-def frame_cache_path(cache_dir, cache_prefix, data_index, t_dyn):
-    return cache_path(cache_dir, cache_prefix + "_frames", data_index, t_dyn)
-
-
-def frame_times_path(cache_dir, cache_prefix, data_index, t_dyn):
-    return times_path(cache_dir, cache_prefix + "_frames", data_index, t_dyn)
-
-
-def atomic_save(path, values):
-    tmp_path = path + f".tmp.{os.getpid()}.{random.randint(0, 1_000_000)}.npy"
-    np.save(tmp_path, values)
-    os.replace(tmp_path, path)
-
-
 def window_times_array(windows, sample_first_sec):
     return np.asarray(
         [
@@ -391,21 +377,13 @@ class DinoV2StaticFeatureExtractor:
                 idx_to_feat[int(idx)] = feat
 
         segment_feats = []
-        segment_frame_feats = []
-        segment_frame_times = []
         for indices in per_segment_indices:
             frame_feats = np.stack([idx_to_feat[int(idx)] for idx in indices], axis=0)
             segment_feats.append(frame_feats.mean(axis=0))
-            segment_frame_feats.append(frame_feats)
-            segment_frame_times.append(
-                np.asarray(indices, dtype=np.float32) / max(fps, 1e-6)
-            )
 
         return (
             np.stack(segment_feats, axis=0).astype(np.float32),
             window_times_array(windows, self.sample_first_sec),
-            np.stack(segment_frame_feats, axis=0).astype(np.float16),
-            np.stack(segment_frame_times, axis=0).astype(np.float32),
         )
 
 
@@ -420,7 +398,6 @@ def precompute_split(
     limit=None,
     overwrite=False,
     seed=2026,
-    save_frame_sequences=False,
 ):
     rows = read_split(root_path, split_name)
     os.makedirs(cache_dir, exist_ok=True)
@@ -444,22 +421,9 @@ def precompute_split(
             continue
 
         out_path = cache_path(cache_dir, cache_prefix, data_index, t_dyn)
-        out_times_path = times_path(cache_dir, cache_prefix, data_index, t_dyn)
-        out_frame_path = frame_cache_path(
-            cache_dir, cache_prefix, data_index, t_dyn
-        )
-        out_frame_times_path = frame_times_path(
-            cache_dir, cache_prefix, data_index, t_dyn
-        )
-        frame_cache_ready = (
-            os.path.exists(out_frame_path)
-            and os.path.exists(out_frame_times_path)
-        )
         if not overwrite and (
             os.path.exists(out_path)
             or already_precomputed_any(cache_dir, cache_prefix, data_index)
-        ) and os.path.exists(out_times_path) and (
-            not save_frame_sequences or frame_cache_ready
         ):
             skipped_existing += 1
             continue
@@ -475,33 +439,20 @@ def precompute_split(
         if extracted is None:
             append_failed_video(failed_log_path, data_index, video_path, "video_error")
             continue
-        static_feat, static_times, frame_feat, frame_times = extracted
+        static_feat, static_times = extracted
         if static_feat.shape != (t_dyn, extractor.static_in_dim):
             raise ValueError(
                 f"Unexpected static feature shape for {data_index}: "
                 f"{static_feat.shape}, expected {(t_dyn, extractor.static_in_dim)}"
             )
 
-        expected_frames = int(
-            round(extractor.sample_first_sec * extractor.frames_per_second)
-        )
-        expected_frame_shape = (t_dyn, max(expected_frames, 1), extractor.static_in_dim)
-        if frame_feat.shape != expected_frame_shape:
-            raise ValueError(
-                f"Unexpected frame feature shape for {data_index}: "
-                f"{frame_feat.shape}, expected {expected_frame_shape}"
-            )
-        if frame_times.shape != frame_feat.shape[:2]:
-            raise ValueError(
-                f"Frame timestamps do not match frame features for {data_index}: "
-                f"{frame_times.shape} versus {frame_feat.shape[:2]}"
-            )
-
-        atomic_save(out_path, static_feat)
-        atomic_save(out_times_path, static_times)
-        if save_frame_sequences:
-            atomic_save(out_frame_path, frame_feat)
-            atomic_save(out_frame_times_path, frame_times)
+        tmp_path = out_path + f".tmp.{os.getpid()}.{random.randint(0, 1_000_000)}.npy"
+        np.save(tmp_path, static_feat)
+        os.replace(tmp_path, out_path)
+        out_times_path = times_path(cache_dir, cache_prefix, data_index, t_dyn)
+        tmp_times_path = out_times_path + f".tmp.{os.getpid()}.{random.randint(0, 1_000_000)}.npy"
+        np.save(tmp_times_path, static_times)
+        os.replace(tmp_times_path, out_times_path)
         processed += 1
         print(
             f"[action] saved {out_path}, shape={static_feat.shape}, "
@@ -546,7 +497,6 @@ def precompute_finefs(
     overwrite=False,
     seed=2026,
     stride=2.0,
-    save_frame_sequences=False,
 ):
     from decord import VideoReader, cpu
 
@@ -572,22 +522,7 @@ def precompute_finefs(
 
         out_path = cache_path(cache_dir, cache_prefix, data_index, t_dyn)
         out_times_path = times_path(cache_dir, cache_prefix, data_index, t_dyn)
-        out_frame_path = frame_cache_path(
-            cache_dir, cache_prefix, data_index, t_dyn
-        )
-        out_frame_times_path = frame_times_path(
-            cache_dir, cache_prefix, data_index, t_dyn
-        )
-        frame_cache_ready = (
-            os.path.exists(out_frame_path)
-            and os.path.exists(out_frame_times_path)
-        )
-        if (
-            not overwrite
-            and os.path.exists(out_path)
-            and os.path.exists(out_times_path)
-            and (not save_frame_sequences or frame_cache_ready)
-        ):
+        if not overwrite and os.path.exists(out_path) and os.path.exists(out_times_path):
             skipped_existing += 1
             continue
         print(
@@ -600,17 +535,13 @@ def precompute_finefs(
         if extracted is None:
             append_failed_video(failed_log_path, data_index, video_path, "video_error")
             continue
-        static_feat, static_times, frame_feat, frame_times = extracted
-        if frame_feat.shape[:2] != frame_times.shape:
-            raise ValueError(
-                f"Frame timestamps do not match frame features for {data_index}: "
-                f"{frame_times.shape} versus {frame_feat.shape[:2]}"
-            )
-        atomic_save(out_path, static_feat)
-        atomic_save(out_times_path, static_times)
-        if save_frame_sequences:
-            atomic_save(out_frame_path, frame_feat)
-            atomic_save(out_frame_times_path, frame_times)
+        static_feat, static_times = extracted
+        tmp_path = out_path + f".tmp.{os.getpid()}.{random.randint(0, 1_000_000)}.npy"
+        np.save(tmp_path, static_feat)
+        os.replace(tmp_path, out_path)
+        tmp_times_path = out_times_path + f".tmp.{os.getpid()}.{random.randint(0, 1_000_000)}.npy"
+        np.save(tmp_times_path, static_times)
+        os.replace(tmp_times_path, out_times_path)
         processed += 1
     print(
         f"[action] FineFS done: processed={processed}, existing={skipped_existing}",
@@ -675,14 +606,6 @@ def main():
     parser.add_argument("--clip_len", type=float, default=5.0)
     parser.add_argument("--sample_first_sec", type=float, default=2.0)
     parser.add_argument("--frames_per_second", type=int, default=2)
-    parser.add_argument(
-        "--save_frame_sequences",
-        action="store_true",
-        help=(
-            "Save ordered per-frame DINO sidecars in addition to the existing "
-            "per-window mean cache."
-        ),
-    )
     parser.add_argument("--hub_dir", type=str, default=None)
     parser.add_argument("--disable_amp", action="store_true")
     parser.add_argument(
@@ -763,7 +686,6 @@ def main():
             overwrite=args.overwrite,
             seed=args.seed,
             stride=args.finefs_stride,
-            save_frame_sequences=args.save_frame_sequences,
         )
         print("[action] DINOv2 FineFS precompute finished.", flush=True)
         return
@@ -786,7 +708,6 @@ def main():
             limit=args.limit,
             overwrite=args.overwrite,
             seed=args.seed,
-            save_frame_sequences=args.save_frame_sequences,
         )
 
     print("[action] DINOv2 static feature precompute finished.", flush=True)

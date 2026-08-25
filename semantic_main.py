@@ -78,10 +78,6 @@ def parse_args():
     parser.add_argument("--metadata-dim", type=int, default=64)
     parser.add_argument("--temperature", type=float, default=0.07)
     parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--ordered-projection-dim", type=int, default=16)
-    parser.add_argument("--ordered-time-basis", type=int, default=2)
-    parser.add_argument("--ordered-hidden-dim", type=int, default=256)
-    parser.add_argument("--disable-ordered-interaction", action="store_true")
     parser.add_argument("--retrieval-loss-weight", type=float, default=1.0)
     parser.add_argument("--citation-loss-weight", type=float, default=1.0)
     parser.add_argument("--action-loss-weight", type=float, default=0.25)
@@ -173,13 +169,6 @@ def model_from_args(args, corpus, device):
         metadata_dim=args.metadata_dim,
         temperature=args.temperature,
         dropout=args.dropout,
-        ordered_enabled=(
-            "ordered_frame_features" in corpus
-            and not args.disable_ordered_interaction
-        ),
-        ordered_projection_dim=args.ordered_projection_dim,
-        ordered_time_basis=args.ordered_time_basis,
-        ordered_hidden_dim=args.ordered_hidden_dim,
     ).to(device)
 
 
@@ -212,7 +201,7 @@ def prepare_device_corpus(corpus, device):
             [1.0 / counts[str(value)] for value in corpus["instance_ids"]],
             dtype=torch.float32,
         )
-    prepared = {
+    return {
         "features": corpus["keys"].to(device),
         "coarse": corpus["coarse_class_ids"].long().to(device),
         "element": corpus["element_ids"].long().to(device),
@@ -232,50 +221,14 @@ def prepare_device_corpus(corpus, device):
         ),
         "sample_weight": sample_weight.to(device),
     }
-    ordered_fields = (
-        "ordered_frame_features",
-        "ordered_frame_times",
-        "ordered_frame_mask",
-    )
-    if all(name in corpus for name in ordered_fields):
-        # Ordered frame tensors stay on CPU and move per query batch. Keeping the
-        # full [N,T,D] tensor on GPU would waste several GB and reference batches
-        # never consume it.
-        prepared["ordered_frame_features"] = corpus[
-            "ordered_frame_features"
-        ].half().cpu()
-        prepared["ordered_frame_times"] = corpus["ordered_frame_times"].float().cpu()
-        prepared["ordered_frame_mask"] = corpus["ordered_frame_mask"].bool().cpu()
-    return prepared
 
 
-def gather(device_corpus, indices, include_ordered=True):
-    target_device = device_corpus["features"].device
-    device_indices = indices.to(target_device, dtype=torch.long)
-    cpu_indices = indices.to("cpu", dtype=torch.long)
-    ordered_names = {
-        "ordered_frame_features",
-        "ordered_frame_times",
-        "ordered_frame_mask",
-    }
-    result = {}
-    for name, values in device_corpus.items():
-        if name == "instance" or (name in ordered_names and not include_ordered):
-            continue
-        selected = values[cpu_indices] if values.device.type == "cpu" else values[device_indices]
-        if name == "ordered_frame_features":
-            selected = selected.float()
-        result[name] = selected.to(target_device, non_blocking=True)
-    return result
-
-
-def ordered_query_kwargs(batch):
-    if "ordered_frame_features" not in batch:
-        return {}
+def gather(device_corpus, indices):
+    indices = indices.to(device_corpus["features"].device, dtype=torch.long)
     return {
-        "ordered_frame_features": batch["ordered_frame_features"],
-        "ordered_frame_times": batch["ordered_frame_times"],
-        "ordered_frame_mask": batch["ordered_frame_mask"],
+        name: values[indices]
+        for name, values in device_corpus.items()
+        if name != "instance"
     }
 
 
@@ -293,7 +246,7 @@ def forward_training_batch(
     candidate_valid=None,
 ):
     query = gather(device_corpus, query_indices)
-    reference = gather(device_corpus, reference_indices, include_ordered=False)
+    reference = gather(device_corpus, reference_indices)
     different_video = reference["video"].ne(query["video"].unsqueeze(1))
     if candidate_valid is None:
         candidate_valid = torch.ones_like(different_video)
@@ -320,7 +273,6 @@ def forward_training_batch(
         reference["score_valid"],
         candidate_valid_mask=candidate_valid,
         candidate_similarities=candidate_similarities,
-        **ordered_query_kwargs(query),
     )
     return output, query, reference, positive_mask, candidate_valid
 
@@ -461,7 +413,7 @@ def mine_training_candidates(
             )
             query = gather(device_corpus, query_batch)
             _, similarities = full_bank_scores(
-                model, query, bank_embeddings,
+                model, query["features"], bank_embeddings,
                 device_corpus["coarse"][bank_indices], bank_element,
             )
             cross_video = query["video"].unsqueeze(1).ne(bank_video.unsqueeze(0))
@@ -572,16 +524,14 @@ def encode_reference_bank(model, device_corpus, reference_indices, batch_size):
     with torch.no_grad():
         for start in range(0, len(reference_indices), batch_size):
             indices = torch.tensor(reference_indices[start : start + batch_size])
-            reference = gather(device_corpus, indices, include_ordered=False)
+            reference = gather(device_corpus, indices)
             normalized = model.encode_reference_visual(reference["features"])
             embeddings.append(normalized)
     return torch.cat(embeddings, dim=0)
 
 
-def full_bank_scores(model, query, bank_embeddings, bank_coarse, bank_element):
-    predicted = model.classify_query(
-        query["features"], **ordered_query_kwargs(query)
-    )
+def full_bank_scores(model, query_features, bank_embeddings, bank_coarse, bank_element):
+    predicted = model.classify_query(query_features)
     return predicted, model.retrieval_scores(
         predicted["query_retrieval"], predicted["action_probability"],
         predicted["coarse_probabilities"], predicted["element_probabilities"],
@@ -727,7 +677,7 @@ def evaluate(args, model, corpus, manifest, split_name, device, device_corpus=No
                 break
             query = gather(device_corpus, query_indices)
             _, similarities = full_bank_scores(
-                model, query, bank_embeddings,
+                model, query["features"], bank_embeddings,
                 device_corpus["coarse"][bank_indices],
                 device_corpus["element"][bank_indices],
             )
@@ -740,7 +690,7 @@ def evaluate(args, model, corpus, manifest, split_name, device, device_corpus=No
             selected = deduplicated_indices(
                 top, bank_indices, bank_instance, args.top_k
             )
-            reference = gather(device_corpus, selected, include_ordered=False)
+            reference = gather(device_corpus, selected)
             dino_similarity = F.cosine_similarity(
                 query["features"].unsqueeze(1), reference["features"], dim=-1
             )
@@ -754,7 +704,6 @@ def evaluate(args, model, corpus, manifest, split_name, device, device_corpus=No
                 reference["panel"],
                 reference["score_valid"],
                 candidate_similarities=dino_similarity,
-                **ordered_query_kwargs(query),
             )
             rerank = output["citation_weights"].argsort(dim=-1, descending=True)
             predicted_action_batch = torch.sigmoid(output["action_logit"]).ge(0.5).cpu().tolist()
@@ -890,9 +839,7 @@ def classifier_metrics(model, loader, device_corpus, corpus, args):
             if args.limit_eval_batches is not None and batch_index >= args.limit_eval_batches:
                 break
             batch = gather(device_corpus, indices)
-            output = model.classify_query(
-                batch["features"], **ordered_query_kwargs(batch)
-            )
+            output = model.classify_query(batch["features"])
             action = batch["coarse"].ne(background)
             truth_action.extend(action.cpu().tolist())
             pred_action.extend(output["action_probability"].ge(0.5).cpu().tolist())
@@ -956,14 +903,12 @@ def element_coarse_mapping(corpus):
 
 
 def save_classifier_checkpoint(path, model, optimizer, args, corpus, manifest, epoch, validation):
-    config = dict(vars(args))
-    config["ordered_enabled"] = bool(model.ordered_enabled)
     torch.save({
         "format_version": SEMANTIC_FORMAT_VERSION,
         "training_stage": CLASSIFIER_STAGE,
         "classifier_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(), "epoch": epoch,
-        "validation": validation, "config": config,
+        "validation": validation, "config": vars(args),
         "coarse_class_vocab": list(corpus["coarse_class_vocab"]),
         "element_vocab": list(corpus["element_vocab"]),
         "element_to_coarse": element_coarse_mapping(corpus),
@@ -973,20 +918,9 @@ def save_classifier_checkpoint(path, model, optimizer, args, corpus, manifest, e
 
 
 def train_classifier(args, corpus, manifest, device):
-    ordered_enabled = (
-        "ordered_frame_features" in corpus
-        and not args.disable_ordered_interaction
-    )
-    if not ordered_enabled and not args.disable_ordered_interaction:
-        raise ValueError(
-            "ordered classifier training requires an ordered corpus; rebuild it "
-            "with --include-ordered-sequences or pass --disable-ordered-interaction"
-        )
     model = SemanticQueryClassifier(
         len(corpus["coarse_class_vocab"]), len(corpus["element_vocab"]),
         corpus["keys"].shape[1], args.evidence_dim, args.encoder_hidden_dim, args.dropout,
-        ordered_enabled, args.ordered_projection_dim, args.ordered_time_basis,
-        args.ordered_hidden_dim,
     ).to(device)
     device_corpus = prepare_device_corpus(corpus, device)
     train_dataset = FineFSSemanticDataset(corpus, manifest["splits"]["train"])
@@ -1011,8 +945,7 @@ def train_classifier(args, corpus, manifest, device):
         model.train(); totals = defaultdict(float); samples = 0
         for batch_index, indices in enumerate(train_loader):
             if args.limit_train_batches is not None and batch_index >= args.limit_train_batches: break
-            batch = gather(device_corpus, indices)
-            output = model(batch["features"], **ordered_query_kwargs(batch))
+            batch = gather(device_corpus, indices); output = model(batch["features"])
             is_action = batch["coarse"].ne(background); weight = batch["sample_weight"]
             action_each = F.binary_cross_entropy_with_logits(output["action_logit"], is_action.float(), reduction="none")
             action_mass = torch.stack([weight[~is_action].sum(), weight[is_action].sum()]).clamp_min(1e-12)
@@ -1041,17 +974,6 @@ def train_classifier(args, corpus, manifest, device):
 
 
 def save_checkpoint(path, model, optimizer, args, corpus, manifest, epoch, validation):
-    config = dict(vars(args))
-    config["ordered_enabled"] = bool(model.classifier.ordered_enabled)
-    if model.classifier.ordered_enabled:
-        ordered = model.classifier.ordered_encoder
-        config.update(
-            {
-                "ordered_projection_dim": ordered.projection_dim,
-                "ordered_time_basis": ordered.time_basis,
-                "ordered_hidden_dim": ordered.descriptor_encoder[1].out_features,
-            }
-        )
     torch.save(
         {
             "format_version": SEMANTIC_FORMAT_VERSION,
@@ -1061,7 +983,7 @@ def save_checkpoint(path, model, optimizer, args, corpus, manifest, epoch, valid
             "training_stage": GOE_STAGE,
             "epoch": epoch,
             "validation": validation,
-            "config": config,
+            "config": vars(args),
             "corpus_version": corpus["metadata_version"],
             "split_format_version": manifest["format_version"],
             "coarse_class_vocab": list(corpus["coarse_class_vocab"]),
