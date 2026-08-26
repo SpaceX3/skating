@@ -115,7 +115,7 @@ def av_collate_fn(batch):
 
 
 class FeatureDatasetWithStaticCache(data.Dataset):
-    def __init__(self, root_path, is_train=True, cache_dir_name="static_videomae_c1_cache", cache_prefix="static_videomae_c1", static_feature_dim=768):
+    def __init__(self, root_path, is_train=True, cache_dir_name="static_videomae_c1_first_token_cache", cache_prefix="static_videomae_c1_first_token", static_feature_dim=768):
         self.root_path = os.path.abspath(root_path)
         self.cache_dir = (
             cache_dir_name

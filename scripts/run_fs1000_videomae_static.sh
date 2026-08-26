@@ -5,8 +5,8 @@ MODE="${1:-all}"
 REPO_DIR="${REPO_DIR:-/home/v100/.worktrees/skating-videomae-static}"
 DATASET_ROOT="${DATASET_ROOT:-/home/v100/ZYQ/FS1000 Dataset}"
 FEATURE_ROOT="${FEATURE_ROOT:-/media/v100/disk3t/finefs_pocr_classifier/features/fs1000_videomae_base_1s_stride05}"
-CACHE_DIR="${CACHE_DIR:-/media/v100/disk3t/skating/fs1000_static_videomae_c1}"
-RUN_DIR="${RUN_DIR:-/media/v100/disk3t/skating/experiments/videomae_static_c1/manual_seed2027}"
+CACHE_DIR="${CACHE_DIR:-/media/v100/disk3t/skating/fs1000_static_videomae_c1_first_token}"
+RUN_DIR="${RUN_DIR:-/media/v100/disk3t/skating/experiments/videomae_static_c1_first_token/manual_seed2026}"
 GPU_UUID="${GPU_UUID:-GPU-f40ff723-535e-10df-74d9-4b38ebeac3c5}"
 SKATING_PYTHON="${SKATING_PYTHON:-/home/v100/anaconda3/envs/skating-action/bin/python}"
 C1_PYTHON="${C1_PYTHON:-/home/v100/anaconda3/envs/skating-action-e10/bin/python}"
@@ -31,8 +31,8 @@ run_train() {
     --gpu 0 \
     --root-path "$DATASET_ROOT" \
     --static-cache-dir "$CACHE_DIR" \
-    --static-cache-prefix static_videomae_c1 \
-    --seed 2027 \
+    --static-cache-prefix static_videomae_c1_first_token \
+    --seed 2026 \
     --epochs 200 \
     --batch-size 16 \
     --num-workers 8 \
@@ -45,7 +45,7 @@ run_eval() {
       --gpu 0 \
       --root-path "$DATASET_ROOT" \
       --static-cache-dir "$CACHE_DIR" \
-      --static-cache-prefix static_videomae_c1 \
+      --static-cache-prefix static_videomae_c1_first_token \
       --checkpoint "$RUN_DIR/$checkpoint"
     echo
   done
