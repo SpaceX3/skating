@@ -109,9 +109,14 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--checkpoint",
-        default="/home/v100/ZYQ/skating/fs800_result/checkpoint_epoch102_loss61.58_spear0.859.pth",
+        default="/media/v100/disk3t/skating/experiments/videomae_static_c1/run_seed2026/best_spearman.pth",
     )
-    parser.add_argument("--root-path", default="../FS1000 Dataset/")
+    parser.add_argument("--root-path", default="/home/v100/ZYQ/FS1000 Dataset")
+    parser.add_argument(
+        "--static-cache-dir",
+        default="/media/v100/disk3t/skating/fs1000_static_videomae_c1",
+    )
+    parser.add_argument("--static-cache-prefix", default="static_videomae_c1")
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--score-index", type=int, default=0)
@@ -124,7 +129,13 @@ def main():
     else:
         device = torch.device(f"cuda:{args.gpu}")
 
-    val_dataset = FeatureDatasetWithStaticCache(root_path=args.root_path, is_train=False)
+    val_dataset = FeatureDatasetWithStaticCache(
+        root_path=args.root_path,
+        is_train=False,
+        cache_dir_name=args.static_cache_dir,
+        cache_prefix=args.static_cache_prefix,
+        static_feature_dim=768,
+    )
     val_dataloader = data.DataLoader(
         dataset=val_dataset,
         batch_size=args.batch_size,
@@ -140,7 +151,7 @@ def main():
         input_len=16,
         num_scores=1,
         use_static_branch=True,
-        static_in_dim=2048,
+        static_in_dim=768,
         static_proj_dim=128,
     ).to(device)
 
@@ -148,8 +159,7 @@ def main():
     model.load_state_dict(state_dict, strict=True)
 
     criterion = torch.nn.MSELoss()
-    # val_loss, spear = validate(val_dataloader, model, criterion, args.score_index, device)
-    val_loss, spear = validation(val_dataloader, model, criterion, args.score_index)
+    val_loss, spear = validate(val_dataloader, model, criterion, args.score_index, device)
     print(f"checkpoint: {args.checkpoint}")
     print(f"device: {device}")
     print(f"validation samples: {len(val_dataset)}")

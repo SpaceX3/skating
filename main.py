@@ -1,5 +1,7 @@
 from typing_extensions import final
 import argparse
+import json
+import random
 import torch
 import torch.utils.data as data
 import os
@@ -38,21 +40,38 @@ def build_optimizer_and_scheduler(model, lr=1e-4, weight_decay=5e-6, step_size=2
     return optimizer, scheduler
 
 
-def checkpoint_path(epoch_idx, val_loss, spear):
-    output_dir = "./fs800_result"
+dev = 0
+
+
+def checkpoint_path(output_dir, kind):
     os.makedirs(output_dir, exist_ok=True)
-    return os.path.join(output_dir, "checkpoint_epoch{}_loss{:.2f}_spear{:.3f}.pth".format(
-        epoch_idx,
-        val_loss,
-        spear,
-    ))
+    return os.path.join(output_dir, "best_{}.pth".format(kind))
 
 
-def save_best_checkpoint(model, save_path, previous_path):
+def save_best_checkpoint(model, save_path):
     torch.save(model.state_dict(), save_path)
-    if previous_path and previous_path != save_path and os.path.exists(previous_path):
-        os.remove(previous_path)
     return save_path
+
+
+def build_model():
+    return scoring_head(
+        depth=2,
+        input_dim=768,
+        dim=512,
+        input_len=16,
+        num_scores=1,
+        use_static_branch=True,
+        static_in_dim=768,
+        static_proj_dim=128,
+    )
+
+
+def seed_everything(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 class Tee:
@@ -118,33 +137,54 @@ def validation(dataloader, model, criterion, score_index):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument("--gpu", type=int, default=dev)
-    parser.add_argument("--log-dir", default="./fs800_result")
+    parser.add_argument("--gpu", type=int, default=0)
+    parser.add_argument("--root-path", default="/home/v100/ZYQ/FS1000 Dataset")
+    parser.add_argument(
+        "--static-cache-dir",
+        default="/media/v100/disk3t/skating/fs1000_static_videomae_c1",
+    )
+    parser.add_argument("--static-cache-prefix", default="static_videomae_c1")
+    parser.add_argument(
+        "--log-dir",
+        default="/media/v100/disk3t/skating/experiments/videomae_static_c1/run_seed2026",
+    )
     parser.add_argument("--log-file", default=None)
+    parser.add_argument("--seed", type=int, default=2026)
+    parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--num-workers", type=int, default=8)
     args = parser.parse_args()
     dev = args.gpu
+    seed_everything(args.seed)
     log_stream = setup_log_output(args.log_dir, args.log_file)
+    with open(os.path.join(args.log_dir, "resolved_config.json"), "w") as handle:
+        json.dump(vars(args), handle, indent=2, sort_keys=True)
+        handle.write("\n")
 
     # build dataset
-    train_dataset = FeatureDatasetWithStaticCache(root_path = '../FS1000 Dataset/', is_train = True)
-    val_dataset = FeatureDatasetWithStaticCache(root_path = '../FS1000 Dataset/', is_train = False)
+    train_dataset = FeatureDatasetWithStaticCache(
+        root_path=args.root_path,
+        is_train=True,
+        cache_dir_name=args.static_cache_dir,
+        cache_prefix=args.static_cache_prefix,
+        static_feature_dim=768,
+    )
+    val_dataset = FeatureDatasetWithStaticCache(
+        root_path=args.root_path,
+        is_train=False,
+        cache_dir_name=args.static_cache_dir,
+        cache_prefix=args.static_cache_prefix,
+        static_feature_dim=768,
+    )
 
-    train_dataloader = data.DataLoader(dataset=train_dataset, batch_size=16, num_workers=8, shuffle=True, collate_fn=av_collate_fn_with_static)
-    val_dataloader = data.DataLoader(dataset=val_dataset, batch_size=16, num_workers=8, collate_fn=av_collate_fn_with_static)
+    generator = torch.Generator().manual_seed(args.seed)
+    train_dataloader = data.DataLoader(dataset=train_dataset, batch_size=args.batch_size, num_workers=args.num_workers, shuffle=True, collate_fn=av_collate_fn_with_static, generator=generator)
+    val_dataloader = data.DataLoader(dataset=val_dataset, batch_size=args.batch_size, num_workers=args.num_workers, collate_fn=av_collate_fn_with_static)
 
     # model
-    model = scoring_head(
-        depth=2,
-        input_dim=768,
-        dim=512,
-        input_len=16,
-        num_scores=1,
-        use_static_branch=True,
-        static_in_dim=2048,
-        static_proj_dim=128,
-    ).cuda(device=dev)  #, bidirection=True
+    model = build_model().cuda(device=dev)
 
-    epochs = 200
+    epochs = args.epochs
     warm_up_epochs = 10
 
     # two-stage training: stage-1 only trains time_score_mlp, stage-2 trains all params
@@ -168,7 +208,7 @@ if __name__ == '__main__':
     score_index = 0
 
     min_val_loss = 10000
-    max_spear_cor = 0
+    max_spear_cor = -float("inf")
     best_loss_checkpoint = None
     best_spear_checkpoint = None
 
@@ -221,13 +261,13 @@ if __name__ == '__main__':
         print("val_loss: ", val_loss, " | spear corr: ", spear)
         if val_loss < min_val_loss:
             min_val_loss = val_loss
-            save_path = checkpoint_path(epoch_idx, val_loss, spear)
-            best_loss_checkpoint = save_best_checkpoint(model, save_path, best_loss_checkpoint)
+            save_path = checkpoint_path(args.log_dir, "loss")
+            best_loss_checkpoint = save_best_checkpoint(model, save_path)
             print("saved best loss checkpoint: ", save_path)
         if spear > max_spear_cor:
             max_spear_cor = spear
-            save_path = checkpoint_path(epoch_idx, val_loss, spear)
-            best_spear_checkpoint = save_best_checkpoint(model, save_path, best_spear_checkpoint)
+            save_path = checkpoint_path(args.log_dir, "spearman")
+            best_spear_checkpoint = save_best_checkpoint(model, save_path)
             print("saved best spear checkpoint: ", save_path)
             
         print("min validation loss: ", min_val_loss, " | max spear corr: ", max_spear_cor)
@@ -235,6 +275,20 @@ if __name__ == '__main__':
         
         
         print(optimizer.param_groups[0]['lr'])
+        torch.save(model.state_dict(), os.path.join(args.log_dir, "last.pth"))
+        with open(os.path.join(args.log_dir, "best_metrics.json"), "w") as handle:
+            json.dump(
+                {
+                    "best_val_loss": min_val_loss,
+                    "best_val_spearman": max_spear_cor,
+                    "last_epoch": epoch_idx,
+                },
+                handle,
+                indent=2,
+                sort_keys=True,
+            )
+            handle.write("\n")
+        print()
         # scheduler.step()
         
         

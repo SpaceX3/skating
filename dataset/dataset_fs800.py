@@ -15,11 +15,9 @@ class FeatureDataset(data.Dataset):
         self.root_path = root_path
         if is_train:
             file_path = root_path + 'train_fs800.txt'
-            f = open(file_path, 'r')
-            data_info = f.readlines()
         else:
             file_path = root_path + 'val_fs800.txt'
-            f = open(file_path, 'r')
+        with open(file_path, 'r') as f:
             data_info = f.readlines()
 
         self.total_data = []
@@ -117,17 +115,20 @@ def av_collate_fn(batch):
 
 
 class FeatureDatasetWithStaticCache(data.Dataset):
-    def __init__(self, root_path, is_train=True, cache_dir_name="static_resnet50_cache", cache_prefix="static_resnet50"):
-        self.root_path = root_path
-        self.cache_dir = os.path.join(root_path, cache_dir_name)
+    def __init__(self, root_path, is_train=True, cache_dir_name="static_videomae_c1_cache", cache_prefix="static_videomae_c1", static_feature_dim=768):
+        self.root_path = os.path.abspath(root_path)
+        self.cache_dir = (
+            cache_dir_name
+            if os.path.isabs(cache_dir_name)
+            else os.path.join(self.root_path, cache_dir_name)
+        )
         self.cache_prefix = cache_prefix
+        self.static_feature_dim = int(static_feature_dim)
         if is_train:
-            file_path = root_path + 'train_fs800.txt'
-            f = open(file_path, 'r')
-            data_info = f.readlines()
+            file_path = os.path.join(self.root_path, 'train_fs800.txt')
         else:
-            file_path = root_path + 'val_fs800.txt'
-            f = open(file_path, 'r')
+            file_path = os.path.join(self.root_path, 'val_fs800.txt')
+        with open(file_path, 'r') as f:
             data_info = f.readlines()
 
         self.total_data = []
@@ -139,8 +140,17 @@ class FeatureDatasetWithStaticCache(data.Dataset):
         data_info = self.total_data[index]
         data_index = data_info[0]
 
-        audio_path = "../FS1000 Dataset/new feature/ast_feature_fs1000_new/" + data_index + '.npy'
-        video_path = "../FS1000 Dataset/Timesformer_output_feature_fs800/" + data_index + '.npy'
+        audio_path = os.path.join(
+            self.root_path,
+            "new feature",
+            "ast_feature_fs1000_new",
+            data_index + '.npy',
+        )
+        video_path = os.path.join(
+            self.root_path,
+            "Timesformer_output_feature_fs800",
+            data_index + '.npy',
+        )
         audio_feature = torch.from_numpy(np.load(audio_path))
         video_feature = torch.from_numpy(np.load(video_path))
 
@@ -148,7 +158,13 @@ class FeatureDatasetWithStaticCache(data.Dataset):
         static_path = os.path.join(self.cache_dir, f"{self.cache_prefix}_{data_index}_T{t_dyn}.npy")
         if not os.path.exists(static_path):
             raise FileNotFoundError(f"Missing static feature cache: {static_path}")
-        static_feature = torch.from_numpy(np.load(static_path))
+        static_values = np.load(static_path)
+        expected_shape = (t_dyn, self.static_feature_dim)
+        if static_values.shape != expected_shape:
+            raise ValueError(
+                f"static feature shape for {data_index} is {static_values.shape}, expected {expected_shape}"
+            )
+        static_feature = torch.from_numpy(static_values)
 
         tes = float(data_info[1])
         pcs = float(data_info[2])
