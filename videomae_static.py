@@ -131,8 +131,8 @@ def select_static_sequence(
             )
             candidate = candidates[selected]
             sequence[timestep_index] = np.asarray(
-                features[candidate["first_index"]], dtype=np.float32
-            ).mean(axis=0)
+                features[candidate["first_index"], 0], dtype=np.float32
+            )
             selected_offset_counts["{:.1f}".format(candidate["offset"])] += 1
             cursor += count
         elif timestep_index:

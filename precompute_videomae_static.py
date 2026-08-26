@@ -65,7 +65,7 @@ def main() -> None:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("/media/v100/disk3t/skating/fs1000_static_videomae_c1"),
+        default=Path("/media/v100/disk3t/skating/fs1000_static_videomae_c1_first_token"),
     )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--batch-size", type=int, default=512)
@@ -85,7 +85,7 @@ def main() -> None:
         )
         dynamic_length = min(len(audio), len(video))
         output_path = args.output_dir / (
-            "static_videomae_c1_{}_T{}.npy".format(video_id, dynamic_length)
+            "static_videomae_c1_first_token_{}_T{}.npy".format(video_id, dynamic_length)
         )
         if output_path.is_file() and not args.overwrite:
             values = np.load(output_path, mmap_mode="r")
@@ -113,11 +113,11 @@ def main() -> None:
     for report in reports:
         offset_counts.update(report.get("selected_offset_counts", {}))
     summary = {
-        "schema_version": "fs1000-static-videomae-c1-v1",
+        "schema_version": "fs1000-static-videomae-c1-first-token-v1",
         "videos": len(reports),
         "seeds": [2026, 2027, 2028],
         "candidate_offsets_seconds": [0.0, 0.5, 1.0, 1.5],
-        "first_cliplet_pooling": "mean_8_temporal_tokens",
+        "first_cliplet_pooling": "first_temporal_token",
         "selected_offset_counts": dict(sorted(offset_counts.items())),
         "incomplete_candidate_groups": sum(
             int(report.get("incomplete_candidate_groups", 0)) for report in reports

@@ -141,12 +141,12 @@ if __name__ == '__main__':
     parser.add_argument("--root-path", default="/home/v100/ZYQ/FS1000 Dataset")
     parser.add_argument(
         "--static-cache-dir",
-        default="/media/v100/disk3t/skating/fs1000_static_videomae_c1",
+        default="/media/v100/disk3t/skating/fs1000_static_videomae_c1_first_token",
     )
-    parser.add_argument("--static-cache-prefix", default="static_videomae_c1")
+    parser.add_argument("--static-cache-prefix", default="static_videomae_c1_first_token")
     parser.add_argument(
         "--log-dir",
-        default="/media/v100/disk3t/skating/experiments/videomae_static_c1/run_seed2026",
+        default="/media/v100/disk3t/skating/experiments/videomae_static_c1_first_token/run_seed2026",
     )
     parser.add_argument("--log-file", default=None)
     parser.add_argument("--seed", type=int, default=2026)

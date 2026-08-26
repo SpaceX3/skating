@@ -60,7 +60,7 @@ class ConfidenceTests(unittest.TestCase):
 
 
 class StaticSequenceTests(unittest.TestCase):
-    def test_selects_candidate_and_means_its_first_eight_tokens(self):
+    def test_selects_candidate_and_takes_its_first_temporal_token(self):
         starts = np.arange(0.0, 8.5, 0.5)
         times = np.stack((starts, starts + 1.0), axis=1)
         features = np.zeros((len(starts), 8, 2), dtype=np.float32)
@@ -79,7 +79,7 @@ class StaticSequenceTests(unittest.TestCase):
 
         expected_first_index = 3
         np.testing.assert_allclose(
-            sequence[0], features[expected_first_index].mean(axis=0)
+            sequence[0], features[expected_first_index, 0]
         )
         self.assertEqual(report["selected_offset_counts"]["1.5"], 1)
         self.assertEqual(report["previous_vector_fallbacks"], 0)
