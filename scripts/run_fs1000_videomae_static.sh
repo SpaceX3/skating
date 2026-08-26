@@ -14,6 +14,10 @@ C1_PYTHON="${C1_PYTHON:-/home/v100/anaconda3/envs/skating-action-e10/bin/python}
 cd "$REPO_DIR"
 
 run_cache() {
+  if [[ -f "$CACHE_DIR/cache_report.json" ]]; then
+    echo "Reusing audited cache: $CACHE_DIR"
+    return
+  fi
   CUDA_VISIBLE_DEVICES="$GPU_UUID" "$C1_PYTHON" precompute_videomae_static.py \
     --dataset-root "$DATASET_ROOT" \
     --feature-root "$FEATURE_ROOT" \
