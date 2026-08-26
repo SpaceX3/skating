@@ -187,7 +187,7 @@ if __name__ == '__main__':
     epochs = args.epochs
     warm_up_epochs = 10
 
-    # two-stage training: stage-1 only trains time_score_mlp, stage-2 trains all params
+    # Two-stage training: first fit the new static branch and score head, then fine-tune all parameters.
     freeze_backbone_epochs = 30
     freeze_static_proj_in_stage2 = False
     set_trainable_params_for_stage(
@@ -199,7 +199,10 @@ if __name__ == '__main__':
         model, lr=1e-4, weight_decay=5e-6, step_size=30, gamma=0.9
     )
     if freeze_backbone_epochs > 0:
-        print(f"Stage-1 enabled: train only time_score_mlp for first {freeze_backbone_epochs} epochs.")
+        print(
+            f"Stage-1 enabled: train static_proj + time_score_mlp for first "
+            f"{freeze_backbone_epochs} epochs."
+        )
 
     # criterion
     criterion = torch.nn.MSELoss()
@@ -218,7 +221,7 @@ if __name__ == '__main__':
             optimizer, scheduler = build_optimizer_and_scheduler(
                 model, lr=1e-4, weight_decay=5e-6, step_size=20, gamma=0.7
             )
-            print("Stage-2 enabled: train dynamic backbone + time head, keep static_proj frozen.")
+            print("Stage-2 enabled: train all parameters, including static_proj.")
 
         model.train()
         print("="*25)
