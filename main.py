@@ -66,6 +66,37 @@ def build_model():
     )
 
 
+def load_dynamic_checkpoint(model, checkpoint_path):
+    excluded_prefixes = ("static_proj.", "time_score_mlp.")
+    checkpoint_state = torch.load(checkpoint_path, map_location="cpu")
+    model_state = model.state_dict()
+    expected_keys = {
+        key for key in model_state if not key.startswith(excluded_prefixes)
+    }
+    dynamic_state = {
+        key: value
+        for key, value in checkpoint_state.items()
+        if not key.startswith(excluded_prefixes)
+    }
+
+    missing_keys = sorted(expected_keys - dynamic_state.keys())
+    unexpected_keys = sorted(dynamic_state.keys() - expected_keys)
+    shape_mismatches = sorted(
+        key
+        for key in expected_keys & dynamic_state.keys()
+        if dynamic_state[key].shape != model_state[key].shape
+    )
+    if missing_keys or unexpected_keys or shape_mismatches:
+        raise ValueError(
+            "dynamic checkpoint mismatch: missing={}, unexpected={}, shape={}".format(
+                missing_keys, unexpected_keys, shape_mismatches
+            )
+        )
+
+    model.load_state_dict(dynamic_state, strict=False)
+    return sorted(dynamic_state)
+
+
 def seed_everything(seed):
     random.seed(seed)
     np.random.seed(seed)
@@ -150,6 +181,7 @@ if __name__ == '__main__':
     )
     parser.add_argument("--log-file", default=None)
     parser.add_argument("--seed", type=int, default=2026)
+    parser.add_argument("--init-dynamic-checkpoint", default=None)
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--num-workers", type=int, default=8)
@@ -182,7 +214,16 @@ if __name__ == '__main__':
     val_dataloader = data.DataLoader(dataset=val_dataset, batch_size=args.batch_size, num_workers=args.num_workers, collate_fn=av_collate_fn_with_static)
 
     # model
-    model = build_model().cuda(device=dev)
+    model = build_model()
+    if args.init_dynamic_checkpoint:
+        loaded_keys = load_dynamic_checkpoint(model, args.init_dynamic_checkpoint)
+        print(
+            "loaded {} dynamic parameters from {}; static_proj and "
+            "time_score_mlp remain randomly initialized".format(
+                len(loaded_keys), args.init_dynamic_checkpoint
+            )
+        )
+    model = model.cuda(device=dev)
 
     epochs = args.epochs
     warm_up_epochs = 10
