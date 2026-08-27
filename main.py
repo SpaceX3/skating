@@ -53,7 +53,7 @@ def save_best_checkpoint(model, save_path):
     return save_path
 
 
-def build_model():
+def build_model(static_in_dim=1536):
     return scoring_head(
         depth=2,
         input_dim=768,
@@ -61,7 +61,7 @@ def build_model():
         input_len=16,
         num_scores=1,
         use_static_branch=True,
-        static_in_dim=768,
+        static_in_dim=static_in_dim,
         static_proj_dim=128,
     )
 
@@ -172,12 +172,13 @@ if __name__ == '__main__':
     parser.add_argument("--root-path", default="/home/v100/ZYQ/FS1000 Dataset")
     parser.add_argument(
         "--static-cache-dir",
-        default="/media/v100/disk3t/skating/fs1000_static_videomae_c1_first_token",
+        default="/media/v100/disk3t/skating/fs1000_static_videomae_c1_class_retrieval",
     )
-    parser.add_argument("--static-cache-prefix", default="static_videomae_c1_first_token")
+    parser.add_argument("--static-cache-prefix", default="static_videomae_c1_class_retrieval")
+    parser.add_argument("--static-feature-dim", type=int, default=1536)
     parser.add_argument(
         "--log-dir",
-        default="/media/v100/disk3t/skating/experiments/videomae_static_c1_first_token/run_seed2026",
+        default="/media/v100/disk3t/skating/experiments/videomae_c1_class_retrieval/manual_seed2026",
     )
     parser.add_argument("--log-file", default=None)
     parser.add_argument("--seed", type=int, default=2026)
@@ -199,14 +200,14 @@ if __name__ == '__main__':
         is_train=True,
         cache_dir_name=args.static_cache_dir,
         cache_prefix=args.static_cache_prefix,
-        static_feature_dim=768,
+        static_feature_dim=args.static_feature_dim,
     )
     val_dataset = FeatureDatasetWithStaticCache(
         root_path=args.root_path,
         is_train=False,
         cache_dir_name=args.static_cache_dir,
         cache_prefix=args.static_cache_prefix,
-        static_feature_dim=768,
+        static_feature_dim=args.static_feature_dim,
     )
 
     generator = torch.Generator().manual_seed(args.seed)
@@ -214,7 +215,7 @@ if __name__ == '__main__':
     val_dataloader = data.DataLoader(dataset=val_dataset, batch_size=args.batch_size, num_workers=args.num_workers, collate_fn=av_collate_fn_with_static)
 
     # model
-    model = build_model()
+    model = build_model(args.static_feature_dim)
     if args.init_dynamic_checkpoint:
         loaded_keys = load_dynamic_checkpoint(model, args.init_dynamic_checkpoint)
         print(

@@ -109,14 +109,15 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--checkpoint",
-        default="/media/v100/disk3t/skating/experiments/videomae_static_c1_first_token/run_seed2026/best_spearman.pth",
+        default="/media/v100/disk3t/skating/experiments/videomae_c1_class_retrieval/manual_seed2026/best_spearman.pth",
     )
     parser.add_argument("--root-path", default="/home/v100/ZYQ/FS1000 Dataset")
     parser.add_argument(
         "--static-cache-dir",
-        default="/media/v100/disk3t/skating/fs1000_static_videomae_c1_first_token",
+        default="/media/v100/disk3t/skating/fs1000_static_videomae_c1_class_retrieval",
     )
-    parser.add_argument("--static-cache-prefix", default="static_videomae_c1_first_token")
+    parser.add_argument("--static-cache-prefix", default="static_videomae_c1_class_retrieval")
+    parser.add_argument("--static-feature-dim", type=int, default=1536)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--score-index", type=int, default=0)
@@ -134,7 +135,7 @@ def main():
         is_train=False,
         cache_dir_name=args.static_cache_dir,
         cache_prefix=args.static_cache_prefix,
-        static_feature_dim=768,
+        static_feature_dim=args.static_feature_dim,
     )
     val_dataloader = data.DataLoader(
         dataset=val_dataset,
@@ -151,7 +152,7 @@ def main():
         input_len=16,
         num_scores=1,
         use_static_branch=True,
-        static_in_dim=768,
+        static_in_dim=args.static_feature_dim,
         static_proj_dim=128,
     ).to(device)
 

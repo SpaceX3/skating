@@ -6,6 +6,7 @@ import torch
 from videomae_static import (
     build_timestep_candidates,
     choose_by_ensemble_confidence,
+    select_static_sequence_and_probabilities,
     select_static_sequence,
 )
 
@@ -60,6 +61,26 @@ class ConfidenceTests(unittest.TestCase):
 
 
 class StaticSequenceTests(unittest.TestCase):
+    def test_returns_probabilities_for_the_selected_candidate(self):
+        starts = np.arange(0.0, 8.5, 0.5)
+        times = np.stack((starts, starts + 1.0), axis=1)
+        features = np.zeros((len(starts), 8, 2), dtype=np.float32)
+        for index in range(len(starts)):
+            features[index, :, 0] = index
+
+        sequence, probabilities, report = select_static_sequence_and_probabilities(
+            features,
+            times,
+            dynamic_length=1,
+            models=(_FirstValueModel(),),
+            device="cpu",
+        )
+
+        self.assertEqual(sequence.shape, (1, 2))
+        self.assertEqual(probabilities.shape, (1, 4))
+        np.testing.assert_allclose(probabilities.sum(axis=1), 1.0)
+        self.assertEqual(report["selected_offset_counts"]["1.5"], 1)
+
     def test_selects_candidate_and_takes_its_first_temporal_token(self):
         starts = np.arange(0.0, 8.5, 0.5)
         times = np.stack((starts, starts + 1.0), axis=1)

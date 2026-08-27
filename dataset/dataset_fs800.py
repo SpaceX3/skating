@@ -164,7 +164,7 @@ class FeatureDatasetWithStaticCache(data.Dataset):
             raise ValueError(
                 f"static feature shape for {data_index} is {static_values.shape}, expected {expected_shape}"
             )
-        static_feature = torch.from_numpy(static_values)
+        static_feature = torch.from_numpy(static_values).float()
 
         tes = float(data_info[1])
         pcs = float(data_info[2])

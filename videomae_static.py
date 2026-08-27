@@ -94,14 +94,14 @@ def _score_candidates(
     )
 
 
-def select_static_sequence(
+def select_static_sequence_and_probabilities(
     features: np.ndarray,
     times: np.ndarray,
     dynamic_length: int,
     models: Sequence[torch.nn.Module],
     device: str = "cuda:0",
     batch_size: int = 512,
-) -> tuple[np.ndarray, dict]:
+) -> tuple[np.ndarray, np.ndarray, dict]:
     features = np.asarray(features)
     times = np.asarray(times)
     if features.ndim != 3 or len(features) != len(times):
@@ -118,6 +118,7 @@ def select_static_sequence(
         features, flat_candidates, models, device=device, batch_size=batch_size
     )
     sequence = np.empty((int(dynamic_length), features.shape[-1]), dtype=np.float32)
+    probabilities = np.empty((int(dynamic_length), seed_logits.shape[-1]), dtype=np.float32)
     selected_offset_counts = {"0.0": 0, "0.5": 0, "1.0": 0, "1.5": 0}
     previous_vector_fallbacks = 0
     incomplete_candidate_groups = 0
@@ -126,24 +127,45 @@ def select_static_sequence(
         count = len(candidates)
         incomplete_candidate_groups += int(count < len(CANDIDATE_OFFSETS))
         if count:
-            selected, _ = choose_by_ensemble_confidence(
+            selected, candidate_probabilities = choose_by_ensemble_confidence(
                 seed_logits[:, cursor : cursor + count]
             )
             candidate = candidates[selected]
             sequence[timestep_index] = np.asarray(
                 features[candidate["first_index"], 0], dtype=np.float32
             )
+            probabilities[timestep_index] = candidate_probabilities[selected]
             selected_offset_counts["{:.1f}".format(candidate["offset"])] += 1
             cursor += count
         elif timestep_index:
             sequence[timestep_index] = sequence[timestep_index - 1]
+            probabilities[timestep_index] = probabilities[timestep_index - 1]
             previous_vector_fallbacks += 1
         else:
             raise ValueError("the first dynamic timestep has no complete C1 candidate")
-    return sequence, {
+    return sequence, probabilities, {
         "dynamic_length": int(dynamic_length),
         "candidate_windows": len(flat_candidates),
         "incomplete_candidate_groups": incomplete_candidate_groups,
         "previous_vector_fallbacks": previous_vector_fallbacks,
         "selected_offset_counts": selected_offset_counts,
     }
+
+
+def select_static_sequence(
+    features: np.ndarray,
+    times: np.ndarray,
+    dynamic_length: int,
+    models: Sequence[torch.nn.Module],
+    device: str = "cuda:0",
+    batch_size: int = 512,
+) -> tuple[np.ndarray, dict]:
+    sequence, _, report = select_static_sequence_and_probabilities(
+        features,
+        times,
+        dynamic_length,
+        models,
+        device=device,
+        batch_size=batch_size,
+    )
+    return sequence, report
