@@ -109,15 +109,15 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--checkpoint",
-        default="/media/v100/disk3t/skating/experiments/videomae_c1_class_retrieval/manual_seed2026/best_spearman.pth",
+        default="/media/v100/disk3t/skating/experiments/videomae_c1_top4_cross_attention/manual_seed2026/best_spearman.pth",
     )
     parser.add_argument("--root-path", default="/home/v100/ZYQ/FS1000 Dataset")
     parser.add_argument(
         "--static-cache-dir",
-        default="/media/v100/disk3t/skating/fs1000_static_videomae_c1_class_retrieval",
+        default="/media/v100/disk3t/skating/fs1000_static_videomae_c1_top4_cross_attention",
     )
-    parser.add_argument("--static-cache-prefix", default="static_videomae_c1_class_retrieval")
-    parser.add_argument("--static-feature-dim", type=int, default=1536)
+    parser.add_argument("--static-cache-prefix", default="static_videomae_c1_top4_cross_attention")
+    parser.add_argument("--static-feature-dim", type=int, default=6914)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--score-index", type=int, default=0)
@@ -154,7 +154,7 @@ def main():
         use_static_branch=True,
         static_in_dim=args.static_feature_dim,
         static_proj_dim=128,
-        use_query_memory_fusion=True,
+        use_top4_cross_attention=True,
     ).to(device)
 
     state_dict = load_state_dict(args.checkpoint, device)

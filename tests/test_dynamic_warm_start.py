@@ -11,7 +11,7 @@ class DynamicWarmStartTests(unittest.TestCase):
     def test_loads_only_dynamic_parameters(self):
         model = main.build_model()
         excluded_prefixes = (
-            "query_memory_fusion.",
+            "query_support_cross_attention.",
             "static_proj.",
             "time_score_mlp.",
         )

@@ -4,6 +4,26 @@ import numpy as np
 import torch
 
 
+def pack_cross_attention_cache(
+    query: np.ndarray,
+    selected_supports: np.ndarray,
+    class_weights: np.ndarray,
+) -> np.ndarray:
+    query = np.asarray(query, dtype=np.float32)
+    selected_supports = np.asarray(selected_supports, dtype=np.float32)
+    class_weights = np.asarray(class_weights, dtype=np.float32)
+    if query.ndim != 2 or selected_supports.ndim != 4:
+        raise ValueError("query and selected_supports must be [B,D] and [B,C,K,D]")
+    batch, classes, _, dim = selected_supports.shape
+    if query.shape != (batch, dim) or class_weights.shape != (batch, classes):
+        raise ValueError("query, supports, and class weights do not align")
+    weights = np.maximum(class_weights, 0.0)
+    weights /= np.maximum(weights.sum(axis=1, keepdims=True), 1e-12)
+    return np.concatenate(
+        (query, selected_supports.reshape(batch, -1), weights), axis=1
+    )
+
+
 def _normalize_tensor_rows(values: torch.Tensor) -> torch.Tensor:
     return values / values.norm(dim=1, keepdim=True).clamp_min(1e-12)
 
@@ -83,6 +103,9 @@ class ClassConditionedRetriever:
         )
         details["top_k"] = int(top_k)
         details["top_classes"] = int(top_classes)
+        details["selected_supports"] = np.take_along_axis(
+            retrieved, details["selected_classes"][..., None, None], axis=1
+        )
         return fused, details
 
 

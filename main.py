@@ -26,7 +26,7 @@ def set_trainable_params_for_stage(model, stage: int, freeze_static_proj_in_stag
         for name, p in model.named_parameters():
             p.requires_grad = any(
                 component in name
-                for component in ("query_memory_fusion", "static_proj", "time_score_mlp")
+                for component in ("query_support_cross_attention", "static_proj", "time_score_mlp")
             )
     else:
         for name, p in model.named_parameters():
@@ -56,7 +56,7 @@ def save_best_checkpoint(model, save_path):
     return save_path
 
 
-def build_model(static_in_dim=1536):
+def build_model(static_in_dim=6914):
     return scoring_head(
         depth=2,
         input_dim=768,
@@ -66,13 +66,13 @@ def build_model(static_in_dim=1536):
         use_static_branch=True,
         static_in_dim=static_in_dim,
         static_proj_dim=128,
-        use_query_memory_fusion=True,
+        use_top4_cross_attention=True,
     )
 
 
 def load_dynamic_checkpoint(model, checkpoint_path):
     excluded_prefixes = (
-        "query_memory_fusion.",
+        "query_support_cross_attention.",
         "static_proj.",
         "time_score_mlp.",
     )
@@ -180,13 +180,13 @@ if __name__ == '__main__':
     parser.add_argument("--root-path", default="/home/v100/ZYQ/FS1000 Dataset")
     parser.add_argument(
         "--static-cache-dir",
-        default="/media/v100/disk3t/skating/fs1000_static_videomae_c1_class_retrieval",
+        default="/media/v100/disk3t/skating/fs1000_static_videomae_c1_top4_cross_attention",
     )
-    parser.add_argument("--static-cache-prefix", default="static_videomae_c1_class_retrieval")
-    parser.add_argument("--static-feature-dim", type=int, default=1536)
+    parser.add_argument("--static-cache-prefix", default="static_videomae_c1_top4_cross_attention")
+    parser.add_argument("--static-feature-dim", type=int, default=6914)
     parser.add_argument(
         "--log-dir",
-        default="/media/v100/disk3t/skating/experiments/videomae_c1_class_retrieval/manual_seed2026",
+        default="/media/v100/disk3t/skating/experiments/videomae_c1_top4_cross_attention/manual_seed2026",
     )
     parser.add_argument("--log-file", default=None)
     parser.add_argument("--seed", type=int, default=2026)
@@ -228,7 +228,7 @@ if __name__ == '__main__':
     if args.init_dynamic_checkpoint:
         loaded_keys = load_dynamic_checkpoint(model, args.init_dynamic_checkpoint)
         print(
-            "loaded {} dynamic parameters from {}; query_memory_fusion, "
+            "loaded {} dynamic parameters from {}; query_support_cross_attention, "
             "static_proj, and time_score_mlp remain newly initialized".format(
                 len(loaded_keys), args.init_dynamic_checkpoint
             )
@@ -251,7 +251,7 @@ if __name__ == '__main__':
     )
     if freeze_backbone_epochs > 0:
         print(
-            f"Stage-1 enabled: train query_memory_fusion + static_proj + "
+            f"Stage-1 enabled: train query_support_cross_attention + static_proj + "
             f"time_score_mlp for first "
             f"{freeze_backbone_epochs} epochs."
         )
