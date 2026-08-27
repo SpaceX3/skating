@@ -10,16 +10,21 @@ import main
 class DynamicWarmStartTests(unittest.TestCase):
     def test_loads_only_dynamic_parameters(self):
         model = main.build_model()
+        excluded_prefixes = (
+            "query_memory_fusion.",
+            "static_proj.",
+            "time_score_mlp.",
+        )
         before = {
             key: value.clone()
             for key, value in model.state_dict().items()
-            if key.startswith(("static_proj.", "time_score_mlp."))
+            if key.startswith(excluded_prefixes)
         }
         source = {}
         for key, value in model.state_dict().items():
             if key == "static_proj.weight":
                 source[key] = torch.full((128, 2048), 9.0)
-            elif key.startswith(("static_proj.", "time_score_mlp.")):
+            elif key.startswith(excluded_prefixes):
                 source[key] = torch.full_like(value, 9.0)
             else:
                 source[key] = torch.full_like(value, 3.0)
@@ -32,7 +37,7 @@ class DynamicWarmStartTests(unittest.TestCase):
 
         self.assertEqual(len(loaded_keys), 34)
         for key, value in model.state_dict().items():
-            if key.startswith(("static_proj.", "time_score_mlp.")):
+            if key.startswith(excluded_prefixes):
                 self.assertTrue(torch.equal(value, before[key]), key)
             else:
                 self.assertTrue(torch.equal(value, torch.full_like(value, 3.0)), key)

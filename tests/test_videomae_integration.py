@@ -82,10 +82,11 @@ class DatasetIntegrationTests(unittest.TestCase):
 
 
 class TrainingEntryPointTests(unittest.TestCase):
-    def test_model_uses_1536_dimensional_static_projection(self):
+    def test_model_fuses_1536d_cache_before_static_projection(self):
         model = main.build_model()
 
-        self.assertEqual(model.static_proj.in_features, 1536)
+        self.assertEqual(model.query_memory_fusion.feature_dim, 768)
+        self.assertEqual(model.static_proj.in_features, 768)
         self.assertEqual(model.static_proj.out_features, 128)
 
     def test_help_starts_without_referencing_undefined_device(self):

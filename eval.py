@@ -154,6 +154,7 @@ def main():
         use_static_branch=True,
         static_in_dim=args.static_feature_dim,
         static_proj_dim=128,
+        use_query_memory_fusion=True,
     ).to(device)
 
     state_dict = load_state_dict(args.checkpoint, device)

@@ -10,8 +10,9 @@ For every FS1000 dynamic timestep:
 4. Retrieve four cosine nearest FineFS training cliplets from each routed class.
 5. Apply `softmax(similarity / 0.1)` within each class, then use the renormalized C1 probabilities across the two classes to obtain knowledge vector `m` (`768D`).
 6. Save `concat(k, m)` as a `1536D` float16 static cache.
+7. During training, split the cache back into `k` and `m`, compute a scalar gate from `[k, m, abs(k-m), k*m]`, and fuse them as `LayerNorm(k + gate * Wm(m))`.
 
-FineFS validation and test cliplets are not used in the bank. The MRU dynamic branch is initialized from `checkpoint_best_0.872.pth`; the `1536 -> 128` static projection and temporal score MLP remain randomly initialized.
+FineFS validation and test cliplets are not used in the bank. The gated fusion outputs `768D`, followed by the existing `768 -> 128` static projection. In the warm-start experiment, the MRU dynamic branch is initialized from `checkpoint_best_0.872.pth`; the gated fusion, static projection, and temporal score MLP remain newly initialized.
 
 No new package is required and the original `skating-action` environment is not modified.
 
@@ -36,7 +37,6 @@ Build the FineFS train-only four-class bank:
 Precompute the FS1000 `concat(k, m)` cache:
 
 ```bash
-CUDA_VISIBLE_DEVICES=GPU-f40ff723-535e-10df-74d9-4b38ebeac3c5 \
 /home/v100/anaconda3/envs/skating-action-e10/bin/python precompute_class_conditioned_static.py \
   --dataset-root "/home/v100/ZYQ/FS1000 Dataset" \
   --feature-root /media/v100/disk3t/finefs_pocr_classifier/features/fs1000_videomae_base_1s_stride05 \
@@ -56,7 +56,6 @@ CUDA_VISIBLE_DEVICES=GPU-f40ff723-535e-10df-74d9-4b38ebeac3c5 \
 Train with the existing dynamic-branch warm start. The static projection and temporal score head are still randomly initialized:
 
 ```bash
-CUDA_VISIBLE_DEVICES=GPU-f40ff723-535e-10df-74d9-4b38ebeac3c5 \
 /home/v100/anaconda3/envs/skating-action/bin/python main.py \
   --gpu 0 \
   --root-path "/home/v100/ZYQ/FS1000 Dataset" \
@@ -64,6 +63,7 @@ CUDA_VISIBLE_DEVICES=GPU-f40ff723-535e-10df-74d9-4b38ebeac3c5 \
   --static-cache-prefix static_videomae_c1_class_retrieval \
   --static-feature-dim 1536 \
   --init-dynamic-checkpoint /home/v100/ZYQ/skating/fs800_result/checkpoint_best_0.872.pth \
+  --freeze-backbone-epochs 30 \
   --seed 2026 \
   --epochs 200 \
   --batch-size 16 \
@@ -71,16 +71,16 @@ CUDA_VISIBLE_DEVICES=GPU-f40ff723-535e-10df-74d9-4b38ebeac3c5 \
   --log-dir /media/v100/disk3t/skating/experiments/videomae_c1_class_retrieval/manual_seed2026_warmstart
 ```
 
-Train from a completely random initialization. This is the requested no-checkpoint variant: leave out `--init-dynamic-checkpoint`, and every model parameter is initialized by `scoring_head`:
+Train from a completely random initialization. This is the requested no-checkpoint variant: leave out `--init-dynamic-checkpoint` and set `--freeze-backbone-epochs 0`, so every newly initialized model parameter is trainable from epoch 0:
 
 ```bash
-CUDA_VISIBLE_DEVICES=GPU-f40ff723-535e-10df-74d9-4b38ebeac3c5 \
 /home/v100/anaconda3/envs/skating-action/bin/python main.py \
   --gpu 0 \
   --root-path "/home/v100/ZYQ/FS1000 Dataset" \
   --static-cache-dir /media/v100/disk3t/skating/fs1000_static_videomae_c1_class_retrieval \
   --static-cache-prefix static_videomae_c1_class_retrieval \
   --static-feature-dim 1536 \
+  --freeze-backbone-epochs 0 \
   --seed 2026 \
   --epochs 200 \
   --batch-size 16 \

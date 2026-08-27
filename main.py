@@ -24,7 +24,10 @@ def set_trainable_params_for_stage(model, stage: int, freeze_static_proj_in_stag
     """
     if stage == 1:
         for name, p in model.named_parameters():
-            p.requires_grad = ("static_proj" in name) or ("time_score_mlp" in name)
+            p.requires_grad = any(
+                component in name
+                for component in ("query_memory_fusion", "static_proj", "time_score_mlp")
+            )
     else:
         for name, p in model.named_parameters():
             if freeze_static_proj_in_stage2 and ("static_proj" in name):
@@ -63,11 +66,16 @@ def build_model(static_in_dim=1536):
         use_static_branch=True,
         static_in_dim=static_in_dim,
         static_proj_dim=128,
+        use_query_memory_fusion=True,
     )
 
 
 def load_dynamic_checkpoint(model, checkpoint_path):
-    excluded_prefixes = ("static_proj.", "time_score_mlp.")
+    excluded_prefixes = (
+        "query_memory_fusion.",
+        "static_proj.",
+        "time_score_mlp.",
+    )
     checkpoint_state = torch.load(checkpoint_path, map_location="cpu")
     model_state = model.state_dict()
     expected_keys = {
@@ -184,6 +192,7 @@ if __name__ == '__main__':
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--init-dynamic-checkpoint", default=None)
     parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--freeze-backbone-epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--num-workers", type=int, default=8)
     args = parser.parse_args()
@@ -219,8 +228,8 @@ if __name__ == '__main__':
     if args.init_dynamic_checkpoint:
         loaded_keys = load_dynamic_checkpoint(model, args.init_dynamic_checkpoint)
         print(
-            "loaded {} dynamic parameters from {}; static_proj and "
-            "time_score_mlp remain randomly initialized".format(
+            "loaded {} dynamic parameters from {}; query_memory_fusion, "
+            "static_proj, and time_score_mlp remain newly initialized".format(
                 len(loaded_keys), args.init_dynamic_checkpoint
             )
         )
@@ -230,7 +239,7 @@ if __name__ == '__main__':
     warm_up_epochs = 10
 
     # Two-stage training: first fit the new static branch and score head, then fine-tune all parameters.
-    freeze_backbone_epochs = 30
+    freeze_backbone_epochs = args.freeze_backbone_epochs
     freeze_static_proj_in_stage2 = False
     set_trainable_params_for_stage(
         model,
@@ -242,7 +251,8 @@ if __name__ == '__main__':
     )
     if freeze_backbone_epochs > 0:
         print(
-            f"Stage-1 enabled: train static_proj + time_score_mlp for first "
+            f"Stage-1 enabled: train query_memory_fusion + static_proj + "
+            f"time_score_mlp for first "
             f"{freeze_backbone_epochs} epochs."
         )
 

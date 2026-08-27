@@ -9,6 +9,33 @@ import time
 import math
 
 
+class QueryMemoryGatedFusion(nn.Module):
+    def __init__(self, feature_dim=768, gate_hidden_dim=128):
+        super().__init__()
+        self.feature_dim = int(feature_dim)
+        self.memory_proj = nn.Linear(self.feature_dim, self.feature_dim)
+        self.gate_mlp = nn.Sequential(
+            nn.Linear(self.feature_dim * 4, int(gate_hidden_dim)),
+            nn.GELU(),
+            nn.Linear(int(gate_hidden_dim), 1),
+        )
+        self.output_norm = nn.LayerNorm(self.feature_dim)
+
+    def forward(self, static_feature):
+        if static_feature.shape[-1] != self.feature_dim * 2:
+            raise ValueError(
+                "query-memory cache must have last dimension {}".format(
+                    self.feature_dim * 2
+                )
+            )
+        query, memory = torch.split(static_feature, self.feature_dim, dim=-1)
+        relation = torch.cat(
+            (query, memory, torch.abs(query - memory), query * memory), dim=-1
+        )
+        gate = torch.sigmoid(self.gate_mlp(relation))
+        return self.output_norm(query + gate * self.memory_proj(memory))
+
+
 def FeedForward(dim, expansion_factor = 4, dropout = 0., dense = nn.Linear):
     return nn.Sequential(
         dense(dim, dim * expansion_factor),
@@ -29,7 +56,7 @@ class PreNormResidual(nn.Module):
         return self.fn(self.norm(x)) + x
 
 class scoring_head(nn.Module):
-    def __init__(self, depth, input_dim, dim, input_len=2, num_scores=1, use_static_branch=False, static_in_dim=2048, static_proj_dim=128):
+    def __init__(self, depth, input_dim, dim, input_len=2, num_scores=1, use_static_branch=False, static_in_dim=2048, static_proj_dim=128, use_query_memory_fusion=False, query_memory_gate_hidden_dim=128):
         super().__init__()
         self.use_static_branch = use_static_branch
 
@@ -56,7 +83,18 @@ class scoring_head(nn.Module):
         hidden2 = max(dim // 4, 1)
         fused_dim = dim + static_proj_dim if self.use_static_branch else dim
         if self.use_static_branch:
-            self.static_proj = nn.Linear(static_in_dim, static_proj_dim)
+            self.use_query_memory_fusion = bool(use_query_memory_fusion)
+            if self.use_query_memory_fusion:
+                if static_in_dim % 2:
+                    raise ValueError("query-memory static input dimension must be even")
+                self.query_memory_fusion = QueryMemoryGatedFusion(
+                    feature_dim=static_in_dim // 2,
+                    gate_hidden_dim=query_memory_gate_hidden_dim,
+                )
+                static_proj_in_dim = static_in_dim // 2
+            else:
+                static_proj_in_dim = static_in_dim
+            self.static_proj = nn.Linear(static_proj_in_dim, static_proj_dim)
         self.time_score_mlp = nn.Sequential(
             nn.Linear(fused_dim, hidden1),
             nn.GELU(),
@@ -122,6 +160,8 @@ class scoring_head(nn.Module):
                 if static_feature is None:
                     raise ValueError("static_feature must be provided when use_static_branch=True")
                 static_time_feat = static_feature[i:i+1, :curr_batch_len]
+                if self.use_query_memory_fusion:
+                    static_time_feat = self.query_memory_fusion(static_time_feat)
                 static_time_feat = self.static_proj(static_time_feat)
                 time_feat = torch.cat([time_feat, static_time_feat], dim=-1)
 
