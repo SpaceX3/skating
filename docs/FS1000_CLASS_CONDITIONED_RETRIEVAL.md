@@ -22,36 +22,90 @@ cd /home/v100/.worktrees/skating-videomae-static
 git switch experiment/fs1000-class-conditioned-retrieval
 ```
 
+The commands below are intentionally expanded; no wrapper script is required.
+
 Build the FineFS train-only four-class bank:
 
 ```bash
-bash scripts/run_fs1000_class_conditioned_retrieval.sh bank
+/home/v100/anaconda3/envs/skating-action/bin/python build_finefs_class_bank.py \
+  --manifest /media/v100/disk3t/finefs_pocr_classifier/experiments/e11_video_grain_split/cliplet_manifest.jsonl \
+  --feature-root /media/v100/disk3t/finefs_pocr_classifier/features/videomae_base_1s_stride05 \
+  --output-dir /media/v100/disk3t/skating/finefs_c1_class_bank_first_token
 ```
 
 Precompute the FS1000 `concat(k, m)` cache:
 
 ```bash
-bash scripts/run_fs1000_class_conditioned_retrieval.sh cache
+CUDA_VISIBLE_DEVICES=GPU-f40ff723-535e-10df-74d9-4b38ebeac3c5 \
+/home/v100/anaconda3/envs/skating-action-e10/bin/python precompute_class_conditioned_static.py \
+  --dataset-root "/home/v100/ZYQ/FS1000 Dataset" \
+  --feature-root /media/v100/disk3t/finefs_pocr_classifier/features/fs1000_videomae_base_1s_stride05 \
+  --finefs-root /home/v100/ZYQ/finefs_pocr_classifier-e11-c1 \
+  --c1-root /media/v100/disk3t/finefs_pocr_classifier/experiments/e11_c1_coarse_dense05/c1 \
+  --bank-dir /media/v100/disk3t/skating/finefs_c1_class_bank_first_token \
+  --output-dir /media/v100/disk3t/skating/fs1000_static_videomae_c1_class_retrieval \
+  --device cuda:0 \
+  --c1-batch-size 512 \
+  --retrieval-batch-size 256 \
+  --top-classes 2 \
+  --top-k 4 \
+  --temperature 0.1 \
+  --probability-power 1.0
 ```
 
-Train without rebuilding either cache:
+Train with the existing dynamic-branch warm start. The static projection and temporal score head are still randomly initialized:
 
 ```bash
-bash scripts/run_fs1000_class_conditioned_retrieval.sh train
+CUDA_VISIBLE_DEVICES=GPU-f40ff723-535e-10df-74d9-4b38ebeac3c5 \
+/home/v100/anaconda3/envs/skating-action/bin/python main.py \
+  --gpu 0 \
+  --root-path "/home/v100/ZYQ/FS1000 Dataset" \
+  --static-cache-dir /media/v100/disk3t/skating/fs1000_static_videomae_c1_class_retrieval \
+  --static-cache-prefix static_videomae_c1_class_retrieval \
+  --static-feature-dim 1536 \
+  --init-dynamic-checkpoint /home/v100/ZYQ/skating/fs800_result/checkpoint_best_0.872.pth \
+  --seed 2026 \
+  --epochs 200 \
+  --batch-size 16 \
+  --num-workers 8 \
+  --log-dir /media/v100/disk3t/skating/experiments/videomae_c1_class_retrieval/manual_seed2026_warmstart
+```
+
+Train from a completely random initialization. This is the requested no-checkpoint variant: leave out `--init-dynamic-checkpoint`, and every model parameter is initialized by `scoring_head`:
+
+```bash
+CUDA_VISIBLE_DEVICES=GPU-f40ff723-535e-10df-74d9-4b38ebeac3c5 \
+/home/v100/anaconda3/envs/skating-action/bin/python main.py \
+  --gpu 0 \
+  --root-path "/home/v100/ZYQ/FS1000 Dataset" \
+  --static-cache-dir /media/v100/disk3t/skating/fs1000_static_videomae_c1_class_retrieval \
+  --static-cache-prefix static_videomae_c1_class_retrieval \
+  --static-feature-dim 1536 \
+  --seed 2026 \
+  --epochs 200 \
+  --batch-size 16 \
+  --num-workers 8 \
+  --log-dir /media/v100/disk3t/skating/experiments/videomae_c1_class_retrieval/manual_seed2026_random
 ```
 
 Evaluate both saved best checkpoints:
 
 ```bash
-bash scripts/run_fs1000_class_conditioned_retrieval.sh eval
-```
+/home/v100/anaconda3/envs/skating-action/bin/python eval.py \
+  --gpu 0 \
+  --root-path "/home/v100/ZYQ/FS1000 Dataset" \
+  --static-cache-dir /media/v100/disk3t/skating/fs1000_static_videomae_c1_class_retrieval \
+  --static-cache-prefix static_videomae_c1_class_retrieval \
+  --static-feature-dim 1536 \
+  --checkpoint /media/v100/disk3t/skating/experiments/videomae_c1_class_retrieval/manual_seed2026_warmstart/best_spearman.pth
 
-To use a different GPU or output directory:
-
-```bash
-GPU_UUID=GPU-... \
-RUN_DIR=/media/v100/disk3t/skating/experiments/videomae_c1_class_retrieval/my_run \
-bash scripts/run_fs1000_class_conditioned_retrieval.sh train
+/home/v100/anaconda3/envs/skating-action/bin/python eval.py \
+  --gpu 0 \
+  --root-path "/home/v100/ZYQ/FS1000 Dataset" \
+  --static-cache-dir /media/v100/disk3t/skating/fs1000_static_videomae_c1_class_retrieval \
+  --static-cache-prefix static_videomae_c1_class_retrieval \
+  --static-feature-dim 1536 \
+  --checkpoint /media/v100/disk3t/skating/experiments/videomae_c1_class_retrieval/manual_seed2026_warmstart/best_loss.pth
 ```
 
 Expected generated locations:
