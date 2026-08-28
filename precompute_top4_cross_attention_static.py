@@ -73,11 +73,7 @@ def main() -> None:
             args.dataset_root / "new feature/ast_feature_fs1000_new" / (video_id + ".npy"),
             mmap_mode="r",
         )
-        video = np.load(
-            args.dataset_root / "Timesformer_output_feature_fs800" / (video_id + ".npy"),
-            mmap_mode="r",
-        )
-        dynamic_length = min(len(audio), len(video))
+        dynamic_length = len(audio)
         output_path = args.output_dir / (
             "{}_{}_T{}.npy".format(CACHE_PREFIX, video_id, dynamic_length)
         )

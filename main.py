@@ -8,7 +8,7 @@ import os
 import sys
 import numpy as np
 from model import scoring_head, head
-from dataset.dataset_fs800 import FeatureDatasetWithStaticCache, av_collate_fn_with_static
+from dataset.dataset_fs800 import FeatureDatasetWithVideoMAE, av_collate_fn_with_static
 from scipy.stats import spearmanr 
 import math
 from datetime import datetime
@@ -56,17 +56,17 @@ def save_best_checkpoint(model, save_path):
     return save_path
 
 
-def build_model(static_in_dim=6914):
+def build_model(static_in_dim=6914, use_static_branch=True):
     return scoring_head(
         depth=2,
         input_dim=768,
         dim=512,
-        input_len=16,
+        input_len=41,
         num_scores=1,
-        use_static_branch=True,
+        use_static_branch=use_static_branch,
         static_in_dim=static_in_dim,
         static_proj_dim=128,
-        use_top4_cross_attention=True,
+        use_top4_cross_attention=use_static_branch,
     )
 
 
@@ -179,6 +179,12 @@ if __name__ == '__main__':
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--root-path", default="/home/v100/ZYQ/FS1000 Dataset")
     parser.add_argument(
+        "--dynamic-video-cache-dir",
+        default="/media/v100/disk3t/skating/fs1000_dynamic_videomae_5x8",
+    )
+    parser.add_argument("--dynamic-video-cache-prefix", default="dynamic_videomae_5x8")
+    parser.add_argument("--use-static-branch", action="store_true")
+    parser.add_argument(
         "--static-cache-dir",
         default="/media/v100/disk3t/skating/fs1000_static_videomae_c1_top4_cross_attention",
     )
@@ -192,7 +198,7 @@ if __name__ == '__main__':
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--init-dynamic-checkpoint", default=None)
     parser.add_argument("--epochs", type=int, default=200)
-    parser.add_argument("--freeze-backbone-epochs", type=int, default=30)
+    parser.add_argument("--freeze-backbone-epochs", type=int, default=0)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--num-workers", type=int, default=8)
     args = parser.parse_args()
@@ -204,18 +210,24 @@ if __name__ == '__main__':
         handle.write("\n")
 
     # build dataset
-    train_dataset = FeatureDatasetWithStaticCache(
+    train_dataset = FeatureDatasetWithVideoMAE(
         root_path=args.root_path,
+        dynamic_cache_dir=args.dynamic_video_cache_dir,
         is_train=True,
-        cache_dir_name=args.static_cache_dir,
-        cache_prefix=args.static_cache_prefix,
+        dynamic_cache_prefix=args.dynamic_video_cache_prefix,
+        use_static_branch=args.use_static_branch,
+        static_cache_dir=args.static_cache_dir,
+        static_cache_prefix=args.static_cache_prefix,
         static_feature_dim=args.static_feature_dim,
     )
-    val_dataset = FeatureDatasetWithStaticCache(
+    val_dataset = FeatureDatasetWithVideoMAE(
         root_path=args.root_path,
+        dynamic_cache_dir=args.dynamic_video_cache_dir,
         is_train=False,
-        cache_dir_name=args.static_cache_dir,
-        cache_prefix=args.static_cache_prefix,
+        dynamic_cache_prefix=args.dynamic_video_cache_prefix,
+        use_static_branch=args.use_static_branch,
+        static_cache_dir=args.static_cache_dir,
+        static_cache_prefix=args.static_cache_prefix,
         static_feature_dim=args.static_feature_dim,
     )
 
@@ -224,7 +236,7 @@ if __name__ == '__main__':
     val_dataloader = data.DataLoader(dataset=val_dataset, batch_size=args.batch_size, num_workers=args.num_workers, collate_fn=av_collate_fn_with_static)
 
     # model
-    model = build_model(args.static_feature_dim)
+    model = build_model(args.static_feature_dim, args.use_static_branch)
     if args.init_dynamic_checkpoint:
         loaded_keys = load_dynamic_checkpoint(model, args.init_dynamic_checkpoint)
         print(

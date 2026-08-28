@@ -220,6 +220,87 @@ def av_collate_fn_with_static(batch):
     return audios, videos, inv_audios, inv_videos, static_features, audio_len, video_len, scores, data_index
 
 
+class FeatureDatasetWithVideoMAE(data.Dataset):
+    def __init__(
+        self,
+        root_path,
+        dynamic_cache_dir,
+        is_train=True,
+        dynamic_cache_prefix="dynamic_videomae_5x8",
+        use_static_branch=False,
+        static_cache_dir=None,
+        static_cache_prefix="static_videomae_c1_top4_cross_attention",
+        static_feature_dim=6914,
+    ):
+        self.root_path = os.path.abspath(root_path)
+        self.dynamic_cache_dir = os.path.abspath(dynamic_cache_dir)
+        self.dynamic_cache_prefix = dynamic_cache_prefix
+        self.use_static_branch = bool(use_static_branch)
+        self.static_cache_dir = os.path.abspath(static_cache_dir) if static_cache_dir else None
+        self.static_cache_prefix = static_cache_prefix
+        self.static_feature_dim = int(static_feature_dim)
+        split_file = "train_fs800.txt" if is_train else "val_fs800.txt"
+        with open(os.path.join(self.root_path, split_file), "r") as handle:
+            self.total_data = [line.strip().split() for line in handle if line.strip()]
+
+    def __len__(self):
+        return len(self.total_data)
+
+    def __getitem__(self, index):
+        data_info = self.total_data[index]
+        video_id = data_info[0]
+        audio = torch.from_numpy(
+            np.load(
+                os.path.join(
+                    self.root_path,
+                    "new feature",
+                    "ast_feature_fs1000_new",
+                    video_id + ".npy",
+                )
+            )
+        ).float()
+        dynamic_length = len(audio)
+        video_path = os.path.join(
+            self.dynamic_cache_dir,
+            f"{self.dynamic_cache_prefix}_{video_id}_T{dynamic_length}.npy",
+        )
+        video = torch.from_numpy(np.load(video_path)).float()
+        if video.shape != (dynamic_length, 40, 768):
+            raise ValueError(
+                f"dynamic VideoMAE shape for {video_id} is {tuple(video.shape)}, "
+                f"expected {(dynamic_length, 40, 768)}"
+            )
+
+        if self.use_static_branch:
+            static_path = os.path.join(
+                self.static_cache_dir,
+                f"{self.static_cache_prefix}_{video_id}_T{dynamic_length}.npy",
+            )
+            static = torch.from_numpy(np.load(static_path)).float()
+            if static.shape != (dynamic_length, self.static_feature_dim):
+                raise ValueError(
+                    f"static feature shape for {video_id} is {tuple(static.shape)}, "
+                    f"expected {(dynamic_length, self.static_feature_dim)}"
+                )
+        else:
+            static = torch.empty((dynamic_length, 0), dtype=torch.float32)
+
+        values = [float(value) for value in data_info[1:9]]
+        tes, pcs, ss, trans, perform, composition, interpretation, factor = values
+        pcs /= factor
+        return (
+            audio,
+            video,
+            tes,
+            pcs,
+            ss,
+            trans,
+            perform,
+            composition,
+            interpretation,
+            static,
+            video_id,
+        )
 
 if __name__=='__main__':
     dataset = FeatureDataset("/data1/xiajingfei/data", is_train=False)

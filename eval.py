@@ -6,7 +6,7 @@ import torch
 import torch.utils.data as data
 from scipy.stats import spearmanr
 
-from dataset.dataset_fs800 import FeatureDatasetWithStaticCache, av_collate_fn_with_static
+from dataset.dataset_fs800 import FeatureDatasetWithVideoMAE, av_collate_fn_with_static
 from model import scoring_head
 
 dev=0
@@ -113,6 +113,12 @@ def main():
     )
     parser.add_argument("--root-path", default="/home/v100/ZYQ/FS1000 Dataset")
     parser.add_argument(
+        "--dynamic-video-cache-dir",
+        default="/media/v100/disk3t/skating/fs1000_dynamic_videomae_5x8",
+    )
+    parser.add_argument("--dynamic-video-cache-prefix", default="dynamic_videomae_5x8")
+    parser.add_argument("--use-static-branch", action="store_true")
+    parser.add_argument(
         "--static-cache-dir",
         default="/media/v100/disk3t/skating/fs1000_static_videomae_c1_top4_cross_attention",
     )
@@ -130,11 +136,14 @@ def main():
     else:
         device = torch.device(f"cuda:{args.gpu}")
 
-    val_dataset = FeatureDatasetWithStaticCache(
+    val_dataset = FeatureDatasetWithVideoMAE(
         root_path=args.root_path,
+        dynamic_cache_dir=args.dynamic_video_cache_dir,
         is_train=False,
-        cache_dir_name=args.static_cache_dir,
-        cache_prefix=args.static_cache_prefix,
+        dynamic_cache_prefix=args.dynamic_video_cache_prefix,
+        use_static_branch=args.use_static_branch,
+        static_cache_dir=args.static_cache_dir,
+        static_cache_prefix=args.static_cache_prefix,
         static_feature_dim=args.static_feature_dim,
     )
     val_dataloader = data.DataLoader(
@@ -149,12 +158,12 @@ def main():
         depth=2,
         input_dim=768,
         dim=512,
-        input_len=16,
+        input_len=41,
         num_scores=1,
-        use_static_branch=True,
+        use_static_branch=args.use_static_branch,
         static_in_dim=args.static_feature_dim,
         static_proj_dim=128,
-        use_top4_cross_attention=True,
+        use_top4_cross_attention=args.use_static_branch,
     ).to(device)
 
     state_dict = load_state_dict(args.checkpoint, device)
