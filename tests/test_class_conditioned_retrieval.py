@@ -68,6 +68,40 @@ class ClassConditionedRetrievalTests(unittest.TestCase):
         self.assertGreater(fused[0, 3], 0.0)
         self.assertEqual(details["selected_classes"].tolist(), [[0]])
 
+    def test_retriever_uses_identical_indices_for_support_features_and_scores(self):
+        banks = (
+            np.array([[1.0, 0.0], [0.8, 0.2], [-1.0, 0.0]], dtype=np.float32),
+            np.array([[0.0, 1.0], [0.0, 0.8], [0.0, -1.0]], dtype=np.float32),
+        )
+        score_banks = (
+            np.array([[10.0, 1.0, 11.0], [20.0, 2.0, 22.0], [30.0, 3.0, 33.0]], dtype=np.float32),
+            np.array([[40.0, 4.0, 44.0], [50.0, 5.0, 55.0], [60.0, 6.0, 66.0]], dtype=np.float32),
+        )
+        score_masks = (
+            np.array([1.0, 1.0, 0.0], dtype=np.float32),
+            np.ones(3, dtype=np.float32),
+        )
+        retriever = ClassConditionedRetriever(
+            banks,
+            score_banks=score_banks,
+            score_masks=score_masks,
+            device="cpu",
+        )
+
+        _, details = retriever.retrieve(
+            query=np.array([[1.0, 0.0]], dtype=np.float32),
+            class_probabilities=np.array([[0.9, 0.1]], dtype=np.float32),
+            top_classes=1,
+            top_k=2,
+        )
+
+        np.testing.assert_array_equal(
+            details["selected_support_scores"][0, 0], score_banks[0][:2]
+        )
+        np.testing.assert_array_equal(
+            details["selected_support_score_masks"][0, 0], [1.0, 1.0]
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -56,7 +56,7 @@ def save_best_checkpoint(model, save_path):
     return save_path
 
 
-def build_model(static_in_dim=6914):
+def build_model(static_in_dim=6946):
     return scoring_head(
         depth=2,
         input_dim=768,
@@ -180,13 +180,13 @@ if __name__ == '__main__':
     parser.add_argument("--root-path", default="/home/v100/ZYQ/FS1000 Dataset")
     parser.add_argument(
         "--static-cache-dir",
-        default="/media/v100/disk3t/skating/fs1000_static_videomae_c1_top4_cross_attention",
+        default="/media/v100/disk3t/skating/fs1000_static_videomae_c1_top4_score_attention",
     )
-    parser.add_argument("--static-cache-prefix", default="static_videomae_c1_top4_cross_attention")
-    parser.add_argument("--static-feature-dim", type=int, default=6914)
+    parser.add_argument("--static-cache-prefix", default="static_videomae_c1_top4_score_attention")
+    parser.add_argument("--static-feature-dim", type=int, default=6946)
     parser.add_argument(
         "--log-dir",
-        default="/media/v100/disk3t/skating/experiments/videomae_c1_top4_cross_attention/manual_seed2026",
+        default="/media/v100/disk3t/skating/experiments/videomae_c1_top4_score_attention/manual_seed2026",
     )
     parser.add_argument("--log-file", default=None)
     parser.add_argument("--seed", type=int, default=2026)

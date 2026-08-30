@@ -109,15 +109,15 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--checkpoint",
-        default="/media/v100/disk3t/skating/experiments/videomae_c1_top4_cross_attention/manual_seed2026/best_spearman.pth",
+        default="/media/v100/disk3t/skating/experiments/videomae_c1_top4_score_attention/manual_seed2026/best_spearman.pth",
     )
     parser.add_argument("--root-path", default="/home/v100/ZYQ/FS1000 Dataset")
     parser.add_argument(
         "--static-cache-dir",
-        default="/media/v100/disk3t/skating/fs1000_static_videomae_c1_top4_cross_attention",
+        default="/media/v100/disk3t/skating/fs1000_static_videomae_c1_top4_score_attention",
     )
-    parser.add_argument("--static-cache-prefix", default="static_videomae_c1_top4_cross_attention")
-    parser.add_argument("--static-feature-dim", type=int, default=6914)
+    parser.add_argument("--static-cache-prefix", default="static_videomae_c1_top4_score_attention")
+    parser.add_argument("--static-feature-dim", type=int, default=6946)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--score-index", type=int, default=0)

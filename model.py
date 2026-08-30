@@ -10,14 +10,17 @@ import math
 
 
 class QuerySupportCrossAttention(nn.Module):
-    def __init__(self, feature_dim=768, top_classes=2, top_k=4, attention_dim=128, num_heads=4, dropout=0.1):
+    def __init__(self, feature_dim=768, top_classes=2, top_k=4, score_dim=3, attention_dim=128, num_heads=4, dropout=0.1):
         super().__init__()
         self.feature_dim = int(feature_dim)
         self.top_classes = int(top_classes)
         self.top_k = int(top_k)
+        self.score_dim = int(score_dim)
         self.cache_dim = (
             self.feature_dim
             + self.top_classes * self.top_k * self.feature_dim
+            + self.top_classes * self.top_k * self.score_dim
+            + self.top_classes * self.top_k
             + self.top_classes
         )
         self.query_proj = nn.Linear(self.feature_dim, int(attention_dim))
@@ -26,10 +29,15 @@ class QuerySupportCrossAttention(nn.Module):
             num_heads=int(num_heads),
             dropout=float(dropout),
             kdim=self.feature_dim,
-            vdim=self.feature_dim,
+            vdim=self.feature_dim + self.score_dim + 1,
             batch_first=True,
         )
         self.output_proj = nn.Linear(int(attention_dim), self.feature_dim)
+        self.score_stats_proj = nn.Sequential(
+            nn.Linear(2 * self.score_dim + 1, int(attention_dim)),
+            nn.GELU(),
+            nn.Linear(int(attention_dim), self.feature_dim),
+        )
         self.output_norm = nn.LayerNorm(self.feature_dim)
 
     def forward(self, static_feature):
@@ -46,7 +54,15 @@ class QuerySupportCrossAttention(nn.Module):
         supports = flat[:, self.feature_dim : support_end].reshape(
             -1, self.top_classes, self.top_k, self.feature_dim
         )
-        class_weights = flat[:, support_end:].clamp_min(0.0)
+        score_end = support_end + self.top_classes * self.top_k * self.score_dim
+        scores = flat[:, support_end:score_end].reshape(
+            -1, self.top_classes, self.top_k, self.score_dim
+        )
+        mask_end = score_end + self.top_classes * self.top_k
+        score_masks = flat[:, score_end:mask_end].reshape(
+            -1, self.top_classes, self.top_k
+        ).clamp(0.0, 1.0)
+        class_weights = flat[:, mask_end:].clamp_min(0.0)
         class_weights = class_weights / class_weights.sum(
             dim=1, keepdim=True
         ).clamp_min(1e-12)
@@ -56,14 +72,44 @@ class QuerySupportCrossAttention(nn.Module):
             -1, self.top_classes, -1
         ).reshape(-1, 1, projected_query.shape[-1])
         class_supports = supports.reshape(-1, self.top_k, self.feature_dim)
-        class_context, _ = self.cross_attention(
-            class_queries, class_supports, class_supports, need_weights=False
+        class_scores = scores.reshape(-1, self.top_k, self.score_dim)
+        class_score_masks = score_masks.reshape(-1, self.top_k)
+        class_values = torch.cat(
+            (class_supports, class_scores, class_score_masks[..., None]), dim=-1
+        )
+        class_context, attention_weights = self.cross_attention(
+            class_queries,
+            class_supports,
+            class_values,
+            need_weights=True,
+            average_attn_weights=True,
         )
         class_context = class_context.reshape(
             -1, self.top_classes, projected_query.shape[-1]
         )
         context = torch.sum(class_context * class_weights[..., None], dim=1)
-        output = self.output_norm(query + self.output_proj(context))
+
+        attention_weights = attention_weights.squeeze(1)
+        valid_attention = attention_weights * class_score_masks
+        coverage = valid_attention.sum(dim=1, keepdim=True)
+        score_weights = valid_attention / coverage.clamp_min(1e-12)
+        score_mean = torch.sum(class_scores * score_weights[..., None], dim=1)
+        score_variance = torch.sum(
+            torch.square(class_scores - score_mean[:, None, :])
+            * score_weights[..., None],
+            dim=1,
+        )
+        score_std = torch.sqrt(score_variance.clamp_min(0.0))
+        class_score_stats = torch.cat((score_mean, score_std, coverage), dim=1)
+        class_score_stats = class_score_stats.reshape(
+            -1, self.top_classes, 2 * self.score_dim + 1
+        )
+        score_stats = torch.sum(
+            class_score_stats * class_weights[..., None], dim=1
+        )
+        output = self.output_norm(
+            query + self.output_proj(context) + self.score_stats_proj(score_stats)
+        )
         return output.reshape(*leading_shape, self.feature_dim)
 
 
@@ -87,7 +133,7 @@ class PreNormResidual(nn.Module):
         return self.fn(self.norm(x)) + x
 
 class scoring_head(nn.Module):
-    def __init__(self, depth, input_dim, dim, input_len=2, num_scores=1, use_static_branch=False, static_in_dim=2048, static_proj_dim=128, use_top4_cross_attention=False, top_classes=2, top_k=4, cross_attention_dim=128, cross_attention_heads=4):
+    def __init__(self, depth, input_dim, dim, input_len=2, num_scores=1, use_static_branch=False, static_in_dim=2048, static_proj_dim=128, use_top4_cross_attention=False, top_classes=2, top_k=4, support_score_dim=3, cross_attention_dim=128, cross_attention_heads=4):
         super().__init__()
         self.use_static_branch = use_static_branch
 
@@ -117,8 +163,11 @@ class scoring_head(nn.Module):
             self.use_top4_cross_attention = bool(use_top4_cross_attention)
             if self.use_top4_cross_attention:
                 denominator = 1 + int(top_classes) * int(top_k)
+                metadata_dim = int(top_classes) * int(top_k) * (
+                    int(support_score_dim) + 1
+                )
                 feature_dim, remainder = divmod(
-                    static_in_dim - int(top_classes), denominator
+                    static_in_dim - int(top_classes) - metadata_dim, denominator
                 )
                 if remainder or feature_dim <= 0:
                     raise ValueError("static input dimension does not match cross-attention layout")
@@ -126,6 +175,7 @@ class scoring_head(nn.Module):
                     feature_dim=feature_dim,
                     top_classes=top_classes,
                     top_k=top_k,
+                    score_dim=support_score_dim,
                     attention_dim=cross_attention_dim,
                     num_heads=cross_attention_heads,
                 )

@@ -12,7 +12,7 @@ from class_conditioned_retrieval import (
     ClassConditionedRetriever,
     pack_cross_attention_cache,
 )
-from finefs_class_bank import CLASS_NAMES, load_class_banks
+from finefs_class_bank import CLASS_NAMES, SCORE_DIM, load_class_banks, load_score_banks
 from precompute_videomae_static import atomic_save, load_c1_models, load_split_ids
 from videomae_static import select_static_sequence_and_probabilities
 
@@ -20,8 +20,14 @@ from videomae_static import select_static_sequence_and_probabilities
 TOP_CLASSES = 2
 TOP_K = 4
 FEATURE_DIM = 768
-CACHE_DIM = FEATURE_DIM + TOP_CLASSES * TOP_K * FEATURE_DIM + TOP_CLASSES
-CACHE_PREFIX = "static_videomae_c1_top4_cross_attention"
+CACHE_DIM = (
+    FEATURE_DIM
+    + TOP_CLASSES * TOP_K * FEATURE_DIM
+    + TOP_CLASSES * TOP_K * SCORE_DIM
+    + TOP_CLASSES * TOP_K
+    + TOP_CLASSES
+)
+CACHE_PREFIX = "static_videomae_c1_top4_score_attention"
 
 
 def main() -> None:
@@ -49,12 +55,12 @@ def main() -> None:
     parser.add_argument(
         "--bank-dir",
         type=Path,
-        default=Path("/media/v100/disk3t/skating/finefs_c1_class_bank_first_token"),
+        default=Path("/media/v100/disk3t/skating/finefs_c1_scored_bank_first_token"),
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("/media/v100/disk3t/skating/fs1000_static_videomae_c1_top4_cross_attention"),
+        default=Path("/media/v100/disk3t/skating/fs1000_static_videomae_c1_top4_score_attention"),
     )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--c1-batch-size", type=int, default=512)
@@ -64,7 +70,13 @@ def main() -> None:
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     models = load_c1_models(args.finefs_root, args.c1_root, args.device)
-    retriever = ClassConditionedRetriever(load_class_banks(args.bank_dir), args.device)
+    score_banks, score_masks = load_score_banks(args.bank_dir)
+    retriever = ClassConditionedRetriever(
+        load_class_banks(args.bank_dir),
+        score_banks=score_banks,
+        score_masks=score_masks,
+        device=args.device,
+    )
     reports = []
     route_counts = Counter()
     video_ids = load_split_ids(args.dataset_root)
@@ -111,6 +123,8 @@ def main() -> None:
         cache = pack_cross_attention_cache(
             query,
             retrieval_details["selected_supports"],
+            retrieval_details["selected_support_scores"],
+            retrieval_details["selected_support_score_masks"],
             retrieval_details["class_weights"],
         )
         atomic_save(output_path, cache.astype(np.float16))
@@ -123,11 +137,11 @@ def main() -> None:
         )
 
     summary = {
-        "schema_version": "fs1000-c1-top4-cross-attention-cache-v1",
+        "schema_version": "fs1000-c1-top4-score-attention-cache-v1",
         "class_order": list(CLASS_NAMES),
         "routing": "C1_top2",
         "retrieval": "cosine_top4_per_routed_class",
-        "static_layout": "query_768 + supports_2x4x768 + class_weights_2",
+        "static_layout": "query_768 + supports_2x4x768 + scores_2x4x3 + score_masks_2x4 + class_weights_2",
         "static_feature_dim": CACHE_DIM,
         "dtype": "float16",
         "videos": len(reports),

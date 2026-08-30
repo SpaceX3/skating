@@ -9,7 +9,9 @@ from finefs_class_bank import build_class_banks
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build FineFS train-only coarse-class banks")
+    parser = argparse.ArgumentParser(
+        description="Build FineFS train-only coarse-class banks with element scores"
+    )
     parser.add_argument(
         "--manifest",
         type=Path,
@@ -23,10 +25,20 @@ def main() -> None:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("/media/v100/disk3t/skating/finefs_c1_class_bank_first_token"),
+        default=Path("/media/v100/disk3t/skating/finefs_c1_scored_bank_first_token"),
+    )
+    parser.add_argument(
+        "--annotation-dir",
+        type=Path,
+        default=Path("/home/v100/ZYQ/FineFS/annotation"),
     )
     args = parser.parse_args()
-    report = build_class_banks(args.manifest, args.feature_root, args.output_dir)
+    report = build_class_banks(
+        args.manifest,
+        args.feature_root,
+        args.output_dir,
+        args.annotation_dir,
+    )
     print(json.dumps(report, indent=2, sort_keys=True))
 
 
