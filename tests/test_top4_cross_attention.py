@@ -72,6 +72,40 @@ class Top4CrossAttentionTests(unittest.TestCase):
 
         self.assertFalse(torch.allclose(low_output, high_output))
 
+    def test_zero_support_score_variance_has_finite_gradients(self):
+        torch.manual_seed(7)
+        fusion = QuerySupportCrossAttention(
+            feature_dim=4,
+            top_classes=1,
+            top_k=2,
+            score_dim=3,
+            attention_dim=4,
+            num_heads=1,
+            dropout=0.0,
+        )
+        query = np.array([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32)
+        supports = np.array(
+            [[[[1.0, 0.0, 0.0, 0.0], [0.8, 0.2, 0.0, 0.0]]]],
+            dtype=np.float32,
+        )
+        identical_scores = np.ones((1, 1, 2, 3), dtype=np.float32)
+        masks = np.ones((1, 1, 2), dtype=np.float32)
+        weights = np.ones((1, 1), dtype=np.float32)
+        packed = torch.from_numpy(
+            pack_cross_attention_cache(
+                query, supports, identical_scores, masks, weights
+            )
+        )
+
+        fusion(packed).square().mean().backward()
+
+        bad_gradients = [
+            name
+            for name, parameter in fusion.named_parameters()
+            if parameter.grad is not None and not torch.isfinite(parameter.grad).all()
+        ]
+        self.assertEqual(bad_gradients, [])
+
     def test_training_model_projects_cross_attention_output(self):
         model = main.build_model(static_in_dim=6946)
 

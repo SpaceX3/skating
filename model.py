@@ -99,7 +99,7 @@ class QuerySupportCrossAttention(nn.Module):
             * score_weights[..., None],
             dim=1,
         )
-        score_std = torch.sqrt(score_variance.clamp_min(0.0))
+        score_std = torch.sqrt(score_variance.clamp_min(1e-6))
         class_score_stats = torch.cat((score_mean, score_std, coverage), dim=1)
         class_score_stats = class_score_stats.reshape(
             -1, self.top_classes, 2 * self.score_dim + 1
