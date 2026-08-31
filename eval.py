@@ -118,6 +118,7 @@ def main():
     )
     parser.add_argument("--static-cache-prefix", default="static_videomae_c1_top4_score_attention")
     parser.add_argument("--static-feature-dim", type=int, default=6946)
+    parser.add_argument("--top-classes", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--score-index", type=int, default=0)
@@ -155,6 +156,7 @@ def main():
         static_in_dim=args.static_feature_dim,
         static_proj_dim=128,
         use_top4_cross_attention=True,
+        top_classes=args.top_classes,
     ).to(device)
 
     state_dict = load_state_dict(args.checkpoint, device)

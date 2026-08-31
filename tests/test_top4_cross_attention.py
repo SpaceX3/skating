@@ -6,6 +6,7 @@ import torch
 import main
 from class_conditioned_retrieval import pack_cross_attention_cache
 from model import QuerySupportCrossAttention
+from precompute_top4_cross_attention_static import cache_dimension
 
 
 class Top4CrossAttentionTests(unittest.TestCase):
@@ -111,6 +112,27 @@ class Top4CrossAttentionTests(unittest.TestCase):
 
         self.assertEqual(model.query_support_cross_attention.top_k, 4)
         self.assertEqual(model.query_support_cross_attention.top_classes, 2)
+        self.assertEqual(model.query_support_cross_attention.score_dim, 3)
+        self.assertEqual(model.static_proj.in_features, 768)
+
+    def test_cache_dimension_supports_top2_and_random_one(self):
+        self.assertEqual(cache_dimension(2), 6946)
+        self.assertEqual(cache_dimension(1), 3857)
+
+        query = np.zeros((2, 768), dtype=np.float32)
+        supports = np.zeros((2, 1, 4, 768), dtype=np.float32)
+        scores = np.zeros((2, 1, 4, 3), dtype=np.float32)
+        masks = np.ones((2, 1, 4), dtype=np.float32)
+        weights = np.ones((2, 1), dtype=np.float32)
+        packed = pack_cross_attention_cache(query, supports, scores, masks, weights)
+
+        self.assertEqual(packed.shape, (2, 3857))
+
+    def test_one_class_model_configuration(self):
+        model = main.build_model(static_in_dim=3857, top_classes=1)
+
+        self.assertEqual(model.query_support_cross_attention.top_classes, 1)
+        self.assertEqual(model.query_support_cross_attention.top_k, 4)
         self.assertEqual(model.query_support_cross_attention.score_dim, 3)
         self.assertEqual(model.static_proj.in_features, 768)
 

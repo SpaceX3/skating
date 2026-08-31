@@ -56,7 +56,7 @@ def save_best_checkpoint(model, save_path):
     return save_path
 
 
-def build_model(static_in_dim=6946):
+def build_model(static_in_dim=6946, top_classes=2):
     return scoring_head(
         depth=2,
         input_dim=768,
@@ -67,6 +67,7 @@ def build_model(static_in_dim=6946):
         static_in_dim=static_in_dim,
         static_proj_dim=128,
         use_top4_cross_attention=True,
+        top_classes=top_classes,
     )
 
 
@@ -184,6 +185,7 @@ if __name__ == '__main__':
     )
     parser.add_argument("--static-cache-prefix", default="static_videomae_c1_top4_score_attention")
     parser.add_argument("--static-feature-dim", type=int, default=6946)
+    parser.add_argument("--top-classes", type=int, default=2)
     parser.add_argument(
         "--log-dir",
         default="/media/v100/disk3t/skating/experiments/videomae_c1_top4_score_attention/manual_seed2026",
@@ -224,7 +226,7 @@ if __name__ == '__main__':
     val_dataloader = data.DataLoader(dataset=val_dataset, batch_size=args.batch_size, num_workers=args.num_workers, collate_fn=av_collate_fn_with_static)
 
     # model
-    model = build_model(args.static_feature_dim)
+    model = build_model(args.static_feature_dim, top_classes=args.top_classes)
     if args.init_dynamic_checkpoint:
         loaded_keys = load_dynamic_checkpoint(model, args.init_dynamic_checkpoint)
         print(

@@ -14,20 +14,35 @@ from class_conditioned_retrieval import (
 )
 from finefs_class_bank import CLASS_NAMES, SCORE_DIM, load_class_banks, load_score_banks
 from precompute_videomae_static import atomic_save, load_c1_models, load_split_ids
+from routing_ablation import random_one_class_probabilities
 from videomae_static import select_static_sequence_and_probabilities
 
 
-TOP_CLASSES = 2
 TOP_K = 4
 FEATURE_DIM = 768
-CACHE_DIM = (
-    FEATURE_DIM
-    + TOP_CLASSES * TOP_K * FEATURE_DIM
-    + TOP_CLASSES * TOP_K * SCORE_DIM
-    + TOP_CLASSES * TOP_K
-    + TOP_CLASSES
+DEFAULT_TOP_CLASSES = 2
+DEFAULT_CACHE_PREFIX = "static_videomae_c1_top4_score_attention"
+RANDOM_CACHE_PREFIX = "static_videomae_random1_top4_score_attention"
+DEFAULT_OUTPUT_DIR = Path(
+    "/media/v100/disk3t/skating/fs1000_static_videomae_c1_top4_score_attention"
 )
-CACHE_PREFIX = "static_videomae_c1_top4_score_attention"
+RANDOM_OUTPUT_DIR = Path(
+    "/media/v100/disk3t/skating/fs1000_static_videomae_random1_top4_score_attention"
+)
+
+
+def cache_dimension(top_classes: int, top_k: int = TOP_K) -> int:
+    top_classes = int(top_classes)
+    top_k = int(top_k)
+    if top_classes <= 0 or top_k <= 0:
+        raise ValueError("top_classes and top_k must be positive")
+    return (
+        FEATURE_DIM
+        + top_classes * top_k * FEATURE_DIM
+        + top_classes * top_k * SCORE_DIM
+        + top_classes * top_k
+        + top_classes
+    )
 
 
 def main() -> None:
@@ -60,15 +75,32 @@ def main() -> None:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("/media/v100/disk3t/skating/fs1000_static_videomae_c1_top4_score_attention"),
+        default=None,
     )
+    parser.add_argument("--cache-prefix", default=None)
+    parser.add_argument(
+        "--routing-mode",
+        choices=("c1-top2", "random-one"),
+        default="c1-top2",
+    )
+    parser.add_argument("--routing-seed", type=int, default=2026)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--c1-batch-size", type=int, default=512)
     parser.add_argument("--retrieval-batch-size", type=int, default=256)
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
 
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    top_classes = 1 if args.routing_mode == "random-one" else DEFAULT_TOP_CLASSES
+    output_dir = args.output_dir or (
+        RANDOM_OUTPUT_DIR if args.routing_mode == "random-one" else DEFAULT_OUTPUT_DIR
+    )
+    cache_prefix = args.cache_prefix or (
+        RANDOM_CACHE_PREFIX
+        if args.routing_mode == "random-one"
+        else DEFAULT_CACHE_PREFIX
+    )
+    expected_cache_dim = cache_dimension(top_classes)
+    output_dir.mkdir(parents=True, exist_ok=True)
     models = load_c1_models(args.finefs_root, args.c1_root, args.device)
     score_banks, score_masks = load_score_banks(args.bank_dir)
     retriever = ClassConditionedRetriever(
@@ -90,12 +122,12 @@ def main() -> None:
             mmap_mode="r",
         )
         dynamic_length = min(len(audio), len(video))
-        output_path = args.output_dir / (
-            "{}_{}_T{}.npy".format(CACHE_PREFIX, video_id, dynamic_length)
+        output_path = output_dir / (
+            "{}_{}_T{}.npy".format(cache_prefix, video_id, dynamic_length)
         )
         if output_path.is_file() and not args.overwrite:
             values = np.load(output_path, mmap_mode="r")
-            if values.shape != (dynamic_length, CACHE_DIM):
+            if values.shape != (dynamic_length, expected_cache_dim):
                 raise ValueError("existing cache has the wrong shape: {}".format(output_path))
             reports.append(
                 {"video_id": video_id, "dynamic_length": dynamic_length, "reused": True}
@@ -112,10 +144,14 @@ def main() -> None:
             device=args.device,
             batch_size=args.c1_batch_size,
         )
+        if args.routing_mode == "random-one":
+            probabilities = random_one_class_probabilities(
+                len(query), len(CLASS_NAMES), args.routing_seed, ordinal
+            )
         _, retrieval_details = retriever.retrieve(
             query,
             probabilities,
-            top_classes=TOP_CLASSES,
+            top_classes=top_classes,
             top_k=TOP_K,
             probability_power=1.0,
             query_batch_size=args.retrieval_batch_size,
@@ -139,10 +175,16 @@ def main() -> None:
     summary = {
         "schema_version": "fs1000-c1-top4-score-attention-cache-v1",
         "class_order": list(CLASS_NAMES),
-        "routing": "C1_top2",
+        "routing": args.routing_mode,
+        "routing_seed": int(args.routing_seed)
+        if args.routing_mode == "random-one"
+        else None,
         "retrieval": "cosine_top4_per_routed_class",
-        "static_layout": "query_768 + supports_2x4x768 + scores_2x4x3 + score_masks_2x4 + class_weights_2",
-        "static_feature_dim": CACHE_DIM,
+        "top_classes": top_classes,
+        "static_layout": "query_768 + supports_{}x4x768 + scores_{}x4x3 + score_masks_{}x4 + class_weights_{}".format(
+            top_classes, top_classes, top_classes, top_classes
+        ),
+        "static_feature_dim": expected_cache_dim,
         "dtype": "float16",
         "videos": len(reports),
         "dynamic_timesteps": sum(int(report["dynamic_length"]) for report in reports),
